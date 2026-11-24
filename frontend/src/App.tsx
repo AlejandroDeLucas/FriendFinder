@@ -10,7 +10,16 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { api, assetUrl, formatTime, getStoredPin, setStoredPin } from './api';
+import {
+  type EngineMode,
+  api,
+  assetUrl,
+  formatTime,
+  getEngineMode,
+  getStoredPin,
+  initEngineMode,
+  setStoredPin,
+} from './api';
 import { MediaLibrary } from './components/MediaLibrary';
 import { PeopleGallery } from './components/PeopleGallery';
 import { PersonDetail } from './components/PersonDetail';
@@ -29,7 +38,7 @@ export function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [loading, setLoading] = useState(true);
-  const [backendOffline, setBackendOffline] = useState(false);
+  const [engineMode, setEngineMode] = useState<EngineMode>('browser');
   const [showSettings, setShowSettings] = useState(false);
 
   // Optional Cloudflare PIN access gate
@@ -60,13 +69,14 @@ export function App() {
 
   const refreshAll = useCallback(async () => {
     try {
+      const mode = await initEngineMode();
+      setEngineMode(mode);
       const [pList, mList, sData, setRes] = await Promise.all([
         api.listPersons(),
         api.listMedia(),
         api.getStats(),
         api.getSettings(),
       ]);
-      setBackendOffline(false);
       setPersons(Array.isArray(pList) ? pList : []);
       setMedia(Array.isArray(mList) ? mList : []);
       setStats(sData);
@@ -76,7 +86,7 @@ export function App() {
         setActiveJob(sData.active_jobs[0]);
       }
     } catch {
-      setBackendOffline(true);
+      setEngineMode(getEngineMode());
     } finally {
       setLoading(false);
     }
@@ -300,6 +310,16 @@ export function App() {
           </nav>
 
           <div className="topbar-actions">
+            <span
+              className={`badge ${engineMode === 'server' ? 'badge-success' : 'badge-accent'}`}
+              title={
+                engineMode === 'server'
+                  ? 'Conectado al backend Python (InsightFace + YOLOv8-seg)'
+                  : 'IA ejecutándose 100% en tu navegador (sin servidor)'
+              }
+            >
+              {engineMode === 'server' ? 'Servidor IA' : 'IA local web'}
+            </span>
             <button
               id="btn-open-settings"
               className="btn btn-icon"
@@ -332,35 +352,6 @@ export function App() {
       )}
 
       <main className="main-container">
-        {backendOffline && (
-          <div
-            className="panel"
-            style={{
-              marginBottom: 20,
-              padding: '14px 18px',
-              background: 'var(--warning-soft)',
-              borderColor: 'hsla(36, 76%, 42%, 0.25)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              flexWrap: 'wrap',
-              gap: 12,
-            }}
-          >
-            <div style={{ fontSize: '0.88rem', color: 'var(--ink-primary)' }}>
-              <strong>Backend de IA no conectado todavía.</strong> Si abriste esto en Cloudflare
-              Pages, arranca <code>./run-cloudflare.sh</code> en tu equipo y pega la URL HTTPS en
-              Ajustes.
-            </div>
-            <button
-              id="btn-connect-backend"
-              className="btn btn-dark btn-sm"
-              onClick={() => setShowSettings(true)}
-            >
-              Conectar servidor
-            </button>
-          </div>
-        )}
         {selectedPersonId ? (
           <PersonDetail
             personId={selectedPersonId}
