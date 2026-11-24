@@ -1,0 +1,334 @@
+"""End-to-end and unit tests for FriendFinder backend (ML pipeline, smart discard, PNG cutout, reverse search, ZIP export)."""
+
+from __future__ import annotations
+
+import io
+import zipfile
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture()
+def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run tests against an isolated temporary data directory and SQLite DB."""
+    import app.config as cfg
+    import app.database as db_mod
+    import app.main as main_mod
+    import app.routers.detections as r_det
+    import app.routers.jobs as r_jobs
+    import app.routers.media as r_media
+    import app.routers.persons as r_persons
+    import app.services.exporter as exporter_mod
+    import app.services.extractor as extractor_mod
+    import app.services.pipeline as pipeline_mod
+    import app.services.search as search_mod
+
+    data_dir = tmp_path / "data"
+    dirs = {
+        "DATA_DIR": data_dir,
+        "UPLOADS_DIR": data_dir / "uploads",
+        "FRAMES_DIR": data_dir / "frames",
+        "PORTRAITS_DIR": data_dir / "portraits",
+        "CUTOUTS_DIR": data_dir / "cutouts",
+        "CROPS_DIR": data_dir / "crops",
+        "THUMBS_DIR": data_dir / "thumbs",
+        "EXPORTS_DIR": data_dir / "exports",
+        # Reuse cached models under project data/models so tests don't re-download every run
+        "MODELS_DIR": cfg.MODELS_DIR,
+        "DB_PATH": data_dir / "friendfinder_test.db",
+    }
+    for d in dirs.values():
+        if d.suffix != ".db":
+            d.mkdir(parents=True, exist_ok=True)
+
+    for name, val in dirs.items():
+        monkeypatch.setattr(cfg, name, val)
+
+    monkeypatch.setattr(cfg, "ALL_DATA_DIRS", [v for k, v in dirs.items() if k != "DB_PATH"])
+    monkeypatch.setattr(extractor_mod, "FRAMES_DIR", dirs["FRAMES_DIR"])
+    monkeypatch.setattr(extractor_mod, "PORTRAITS_DIR", dirs["PORTRAITS_DIR"])
+    monkeypatch.setattr(extractor_mod, "CUTOUTS_DIR", dirs["CUTOUTS_DIR"])
+    monkeypatch.setattr(extractor_mod, "CROPS_DIR", dirs["CROPS_DIR"])
+    monkeypatch.setattr(extractor_mod, "THUMBS_DIR", dirs["THUMBS_DIR"])
+    monkeypatch.setattr(pipeline_mod, "FRAMES_DIR", dirs["FRAMES_DIR"])
+    monkeypatch.setattr(pipeline_mod, "THUMBS_DIR", dirs["THUMBS_DIR"])
+    monkeypatch.setattr(r_media, "UPLOADS_DIR", dirs["UPLOADS_DIR"])
+    monkeypatch.setattr(r_persons, "FRAMES_DIR", dirs["FRAMES_DIR"])
+    monkeypatch.setattr(r_persons, "PORTRAITS_DIR", dirs["PORTRAITS_DIR"])
+    monkeypatch.setattr(r_det, "FRAMES_DIR", dirs["FRAMES_DIR"])
+    monkeypatch.setattr(r_det, "PORTRAITS_DIR", dirs["PORTRAITS_DIR"])
+    monkeypatch.setattr(r_det, "THUMBS_DIR", dirs["THUMBS_DIR"])
+    monkeypatch.setattr(exporter_mod, "CROPS_DIR", dirs["CROPS_DIR"])
+    monkeypatch.setattr(exporter_mod, "CUTOUTS_DIR", dirs["CUTOUTS_DIR"])
+    monkeypatch.setattr(exporter_mod, "EXPORTS_DIR", dirs["EXPORTS_DIR"])
+    monkeypatch.setattr(exporter_mod, "FRAMES_DIR", dirs["FRAMES_DIR"])
+    monkeypatch.setattr(exporter_mod, "PORTRAITS_DIR", dirs["PORTRAITS_DIR"])
+
+    test_db = db_mod.Database(db_path=dirs["DB_PATH"])
+    for mod in (db_mod, r_media, r_persons, r_det, r_jobs):
+        monkeypatch.setattr(mod, "db", test_db)
+    monkeypatch.setattr(pipeline_mod, "default_db", test_db)
+    monkeypatch.setattr(search_mod, "default_db", test_db)
+    monkeypatch.setattr(exporter_mod, "default_db", test_db)
+
+    return {
+        "db": test_db,
+        "dirs": dirs,
+        "client": TestClient(main_mod.app),
+    }
+
+
+def _find_sample_image(filename: str) -> Path:
+    import insightface
+    import ultralytics
+
+    candidates = [
+        Path(ultralytics.__file__).resolve().parent / "assets" / filename,
+        Path(insightface.__file__).resolve().parent / "data" / "images" / filename,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError(f"Sample image not found: {filename}")
+
+
+def test_quality_and_smart_discard_unit(isolated_env):
+    """Verify quality scorer penalizes blur and smart discard rejects worse duplicates."""
+    from app.services.ml_models import DetectedBody, DetectedFace
+    from app.services.pipeline import evaluate_keep_or_discard
+    from app.services.quality import score_detection
+
+    db = isolated_env["db"]
+    # Sharp textured synthetic image vs blurred version
+    rng = np.random.default_rng(42)
+    sharp_img = rng.integers(40, 220, size=(600, 600, 3), dtype=np.uint8)
+    blurry_img = cv2.GaussianBlur(sharp_img, (31, 31), 9.0)
+
+    face = DetectedFace(
+        bbox=[220.0, 80.0, 380.0, 260.0],
+        det_score=0.95,
+        embedding=np.ones(512, dtype=np.float32) / np.sqrt(512),
+        pose=(2.0, 3.0, 1.0),
+    )
+    mask = np.zeros((600, 600), dtype=np.uint8)
+    mask[70:580, 180:420] = 255
+    body = DetectedBody(bbox=[180.0, 70.0, 420.0, 580.0], conf=0.92, mask=mask)
+
+    m_sharp = score_detection(sharp_img, face, [body])
+    m_blur = score_detection(blurry_img, face, [body])
+
+    assert m_sharp.sharpness_score > m_blur.sharpness_score + 20.0
+    assert m_sharp.portrait_score > m_blur.portrait_score
+    assert m_sharp.matched_body is body
+
+    # Create a person with 1 high-quality kept portrait and cap max_portraits=1
+    person = db.create_person("Carlos", centroid=face.embedding)
+    media = db.create_media(
+        media_id="m1",
+        original_filename="sharp.jpg",
+        media_type="image",
+        file_path="/tmp/sharp.jpg",
+        file_size=100,
+    )
+    db.insert_detection(
+        {
+            "media_id": media["id"],
+            "person_id": person["id"],
+            "portrait_score": 88.0,
+            "body_score": 85.0,
+            "overall_score": 88.0,
+            "has_cutout": True,
+            "status": "kept",
+            "embedding": face.embedding,
+        }
+    )
+
+    settings = {
+        "min_quality_score": "32.0",
+        "max_portraits_per_person": "1",
+        "max_fullbody_per_person": "1",
+        "min_video_gap_seconds": "1.5",
+    }
+    status, _cat, reason = evaluate_keep_or_discard(
+        db,
+        person_id=person["id"],
+        person_name="Carlos",
+        media_id="m2",
+        timestamp_sec=0.0,
+        metrics=m_blur,
+        settings=settings,
+    )
+    assert status == "discarded"
+    assert reason and ("Calidad insuficiente" in reason or "ya tiene capturas mejores" in reason)
+
+
+def test_full_ml_end_to_end_photo_video_search_export(isolated_env, tmp_path: Path):
+    """Full end-to-end test using real InsightFace + YOLOv8-seg on real photos and a synthetic MP4 video."""
+    from app.services.pipeline import process_media_batch_sync
+
+    db = isolated_env["db"]
+    dirs = isolated_env["dirs"]
+    client = isolated_env["client"]
+
+    # Limit top-K to 1 portrait & 1 body so we reliably trigger smart discarding on degraded duplicates
+    db.update_settings(
+        {
+            "max_portraits_per_person": 1,
+            "max_fullbody_per_person": 1,
+            "video_sample_fps": 1.0,
+        }
+    )
+
+    zidane_path = _find_sample_image("zidane.jpg")
+    bus_path = _find_sample_image("bus.jpg")
+
+    # 1. Create a degraded/blurred copy of zidane.jpg to verify smart discard
+    zidane_bgr = cv2.imread(str(zidane_path))
+    assert zidane_bgr is not None
+    zidane_blur = cv2.GaussianBlur(zidane_bgr, (25, 25), 8.0)
+    blur_path = tmp_path / "zidane_blurry.jpg"
+    cv2.imwrite(str(blur_path), zidane_blur)
+
+    # 2. Build a short 2-second MP4 video containing zidane.jpg (t=0s) and bus.jpg (t=1s)
+    h, w = zidane_bgr.shape[:2]
+    bus_bgr = cv2.imread(str(bus_path))
+    assert bus_bgr is not None
+    bus_resized = cv2.resize(bus_bgr, (w, h))
+    video_path = tmp_path / "friends_clip.mp4"
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        10.0,
+        (w, h),
+    )
+    for _ in range(10):  # 0.0s .. 0.9s -> zidane
+        writer.write(zidane_bgr)
+    for _ in range(10):  # 1.0s .. 1.9s -> bus
+        writer.write(bus_resized)
+    writer.release()
+    assert video_path.exists() and video_path.stat().st_size > 1000
+
+    # Register files and run ingestion synchronously (same pipeline called by background worker)
+    m1_dest = dirs["UPLOADS_DIR"] / "m1.jpg"
+    m1_dest.write_bytes(zidane_path.read_bytes())
+    db.create_media(
+        media_id="m1",
+        original_filename="zidane.jpg",
+        media_type="image",
+        file_path=str(m1_dest),
+        file_size=m1_dest.stat().st_size,
+    )
+
+    m2_dest = dirs["UPLOADS_DIR"] / "m2.jpg"
+    m2_dest.write_bytes(blur_path.read_bytes())
+    db.create_media(
+        media_id="m2",
+        original_filename="zidane_blurry.jpg",
+        media_type="image",
+        file_path=str(m2_dest),
+        file_size=m2_dest.stat().st_size,
+    )
+
+    m3_dest = dirs["UPLOADS_DIR"] / "m3.mp4"
+    m3_dest.write_bytes(video_path.read_bytes())
+    db.create_media(
+        media_id="m3",
+        original_filename="friends_clip.mp4",
+        media_type="video",
+        file_path=str(m3_dest),
+        file_size=m3_dest.stat().st_size,
+    )
+
+    job_id = db.create_job("ingest", total_items=3)
+    summary = process_media_batch_sync(["m1", "m2", "m3"], job_id, database=db)
+
+    assert summary["total_detections"] >= 3
+    assert summary["kept_detections"] >= 2
+    assert summary["discarded_detections"] >= 1
+
+    # Verify blurred duplicate photo was discarded (or had 0 kept improvements)
+    m2_rec = db.get_media("m2")
+    assert m2_rec is not None
+    assert m2_rec["kept_count"] == 0
+    assert m2_rec["verdict"] in ("discarded", "no_people")
+
+    # Verify persons list API
+    resp = client.get("/api/persons")
+    assert resp.status_code == 200
+    persons = resp.json()
+    assert len(persons) >= 2
+
+    # Check that at least one kept detection produced all 3 formats including transparent PNG cutout
+    first_person = persons[0]
+    detail_resp = client.get(f"/api/persons/{first_person['id']}")
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert len(detail["kept_detections"]) >= 1
+    det = detail["kept_detections"][0]
+    assert det["portrait_path"] and (dirs["PORTRAITS_DIR"] / det["portrait_path"]).exists()
+    assert det["frame_path"] and (dirs["FRAMES_DIR"] / det["frame_path"]).exists()
+    assert det["crop_path"] and (dirs["CROPS_DIR"] / det["crop_path"]).exists()
+    assert det["scene_summary"]  # Instant local heuristic description populated
+
+    cutout_dets = [
+        d
+        for p in persons
+        for d in client.get(f"/api/persons/{p['id']}").json()["kept_detections"]
+        if d.get("cutout_path")
+    ]
+    assert len(cutout_dets) >= 1
+    cutout_file = dirs["CUTOUTS_DIR"] / cutout_dets[0]["cutout_path"]
+    assert cutout_file.exists()
+    cutout_rgba = cv2.imread(str(cutout_file), cv2.IMREAD_UNCHANGED)
+    assert cutout_rgba is not None and cutout_rgba.shape[2] == 4  # Has transparency alpha channel!
+
+    # Test renaming a person
+    rename_resp = client.patch(
+        f"/api/persons/{first_person['id']}",
+        json={"name": "Zinedine"},
+    )
+    assert rename_resp.status_code == 200
+    assert rename_resp.json()["name"] == "Zinedine"
+
+    # Test Reverse Search by Photo -> should find matching person AND exact timestamps in friends_clip.mp4!
+    with zidane_path.open("rb") as fh:
+        search_resp = client.post(
+            "/api/search/by-image",
+            files={"file": ("query.jpg", fh, "image/jpeg")},
+        )
+    assert search_resp.status_code == 200
+    sdata = search_resp.json()
+    assert sdata["found_faces"] >= 1
+    assert len(sdata["matched_persons"]) >= 1
+    video_matches = [m for m in sdata["matched_media"] if m["media_id"] == "m3"]
+    assert len(video_matches) == 1
+    assert video_matches[0]["appearances_count"] >= 1
+
+    # Test Game Asset ZIP Export
+    export_resp = client.post(
+        "/api/persons/export",
+        json={
+            "person_ids": [first_person["id"]],
+            "include_portraits": True,
+            "include_cutouts": True,
+            "include_crops": True,
+            "include_originals": True,
+        },
+    )
+    assert export_resp.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(export_resp.content))
+    names = zf.namelist()
+    assert "manifest.json" in names
+    assert any(n.endswith("metadata.json") for n in names)
+    assert any("/portraits/" in n for n in names)
+
+    # Test Safe Video Deletion (keeps person assets!)
+    del_resp = client.delete("/api/media/m3?keep_person_assets=true")
+    assert del_resp.status_code == 200
+    assert not m3_dest.exists()
+    assert (dirs["PORTRAITS_DIR"] / det["portrait_path"]).exists()
+    assert db.get_media("m3")["source_deleted"] == 1

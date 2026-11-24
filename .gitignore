@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local runtime data & downloaded ML models
+data/
+*.db
+*.db-wal
+*.db-shm
+*.pt
+*.onnx
+.insightface/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
