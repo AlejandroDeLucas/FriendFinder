@@ -1,6 +1,7 @@
-import { useRef, useState } from 'react';
-import { Clock, Film, Image as ImageIcon, Play, Search, Upload, UserCheck } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Clipboard, Clock, Film, Image as ImageIcon, Play, Search, Upload, UserCheck } from 'lucide-react';
 import { api, assetUrl, formatTime } from '../api';
+import { extractImagesFromPasteEvent, readImagesFromClipboardApi } from '../clipboard';
 import type { SearchResult } from '../types';
 
 interface Props {
@@ -17,23 +18,57 @@ export function SearchByPhoto({ onSelectPerson, onOpenMediaAt, onToast }: Props)
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<SearchResult | null>(null);
 
-  const runSearch = async (file: File, faceIndex = 0, simThreshold = threshold) => {
-    setLoading(true);
-    try {
-      const data = await api.searchByImage(file, faceIndex, simThreshold);
-      setResult(data);
-    } catch (err) {
-      onToast(err instanceof Error ? err.message : 'Error al buscar');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const runSearch = useCallback(
+    async (file: File, faceIndex = 0, simThreshold = threshold) => {
+      setLoading(true);
+      try {
+        const data = await api.searchByImage(file, faceIndex, simThreshold);
+        setResult(data);
+      } catch (err) {
+        onToast(err instanceof Error ? err.message : 'Error al buscar');
+      } finally {
+        setLoading(false);
+      }
+    },
+    [threshold, onToast]
+  );
 
-  const handleFilePick = (file: File) => {
-    setQueryFile(file);
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setPreviewUrl(URL.createObjectURL(file));
-    void runSearch(file, 0, threshold);
+  const handleFilePick = useCallback(
+    (file: File) => {
+      setQueryFile(file);
+      setPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(file);
+      });
+      void runSearch(file, 0, threshold);
+    },
+    [runSearch, threshold]
+  );
+
+  // Global Ctrl+V / Cmd+V paste while on Search tab
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      const pasted = extractImagesFromPasteEvent(e);
+      if (pasted.length > 0) {
+        e.preventDefault();
+        handleFilePick(pasted[0]);
+        onToast('Imagen pegada del portapapeles. Buscando...');
+      }
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [handleFilePick, onToast]);
+
+  const handlePasteButton = async () => {
+    try {
+      const pasted = await readImagesFromClipboardApi();
+      handleFilePick(pasted[0]);
+      onToast('Imagen pegada del portapapeles. Buscando...');
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'No se pudo leer el portapapeles');
+    }
   };
 
   return (
@@ -42,8 +77,8 @@ export function SearchByPhoto({ onSelectPerson, onOpenMediaAt, onToast }: Props)
         <div>
           <h1 className="page-title">Buscar persona por foto</h1>
           <p className="page-subtitle">
-            Sube una imagen de referencia de cualquier amigo para saber al instante si aparece en
-            tus fotos o vídeos guardados, y saltar exactamente al segundo donde sale.
+            Sube o pega del portapapeles (<kbd>Ctrl+V</kbd> / <kbd>⌘V</kbd>) una imagen de
+            referencia para saber al instante en qué fotos y segundos exactos de vídeo aparece.
           </p>
         </div>
       </header>
@@ -89,13 +124,22 @@ export function SearchByPhoto({ onSelectPerson, onOpenMediaAt, onToast }: Props)
                 <div className="empty-studio-icon" style={{ marginBottom: 10 }}>
                   <Upload size={22} />
                 </div>
-                <div style={{ fontWeight: 600 }}>Elige o arrastra una foto</div>
+                <div style={{ fontWeight: 600 }}>Elige, arrastra o pega una foto</div>
                 <div style={{ fontSize: '0.8rem', color: 'var(--ink-muted)', marginTop: 4 }}>
-                  También funciona con fotos grupales
+                  También funciona con fotos grupales y Ctrl+V / ⌘V
                 </div>
               </>
             )}
           </div>
+
+          <button
+            id="btn-paste-search"
+            type="button"
+            className="btn"
+            onClick={() => void handlePasteButton()}
+          >
+            <Clipboard size={15} /> Pegar foto del portapapeles
+          </button>
 
           <div className="field">
             <label htmlFor="range-threshold">

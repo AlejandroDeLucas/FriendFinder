@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Check,
   CheckCircle2,
+  Clipboard,
   Clock,
   Film,
   Image as ImageIcon,
@@ -14,6 +15,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api, assetUrl, formatBytes } from '../api';
+import { extractImagesFromPasteEvent, readImagesFromClipboardApi } from '../clipboard';
 import type { JobInfo } from '../types';
 
 interface Props {
@@ -76,6 +78,32 @@ export function UploadStudio({
     });
   };
 
+  // Global Ctrl+V / Cmd+V clipboard image paste while on Upload tab
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      const pasted = extractImagesFromPasteEvent(e);
+      if (pasted.length > 0) {
+        e.preventDefault();
+        addFiles(pasted);
+        onToast(`Pegada(s) ${pasted.length} imagen(es) del portapapeles.`);
+      }
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [onToast]);
+
+  const handlePasteButton = async () => {
+    try {
+      const pasted = await readImagesFromClipboardApi();
+      addFiles(pasted);
+      onToast(`Pegada(s) ${pasted.length} imagen(es) del portapapeles.`);
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'No se pudo leer el portapapeles');
+    }
+  };
+
   const removeFile = (idx: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== idx));
   };
@@ -114,8 +142,8 @@ export function UploadStudio({
         <div>
           <h1 className="page-title">Subir fotos y vídeos</h1>
           <p className="page-subtitle">
-            Sube fotos o vídeos desde tu PC o móvil. Extraemos automáticamente los mejores retratos
-            y recortes PNG sin otras personas, descartando tomas borrosas o de menor calidad.
+            Sube fotos o vídeos desde tu PC o móvil, o pega una imagen con <kbd>Ctrl+V</kbd> /{' '}
+            <kbd>⌘V</kbd>. Extraemos los mejores retratos y recortes PNG sin otras personas.
           </p>
         </div>
       </header>
@@ -150,10 +178,21 @@ export function UploadStudio({
           <div className="empty-studio-icon" style={{ marginBottom: 10 }}>
             <Upload size={25} />
           </div>
-          <div className="dropzone-title">Toca o arrastra tus fotos y vídeos</div>
-          <p style={{ margin: 0, color: 'var(--ink-secondary)', fontSize: '0.89rem' }}>
-            JPG, PNG, WebP, MP4, MOV, MKV, WebM · Compatible con carrete de móvil
+          <div className="dropzone-title">Toca, arrastra o pega tus fotos y vídeos</div>
+          <p style={{ margin: '0 0 14px', color: 'var(--ink-secondary)', fontSize: '0.89rem' }}>
+            JPG, PNG, WebP, MP4, MOV, MKV, WebM · También puedes pegar con Ctrl+V / ⌘V
           </p>
+          <button
+            id="btn-paste-upload"
+            type="button"
+            className="btn btn-sm"
+            onClick={(e) => {
+              e.stopPropagation();
+              void handlePasteButton();
+            }}
+          >
+            <Clipboard size={14} /> Pegar del portapapeles
+          </button>
         </div>
 
         {/* 1-hour auto-expiration policy toggle */}

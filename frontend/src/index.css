@@ -77,6 +77,16 @@ button {
   cursor: pointer;
 }
 
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  color: var(--ink-primary);
+}
+
 /* ---------- Layout Shell ---------- */
 .app-shell {
   min-height: 100vh;
