@@ -594,14 +594,56 @@ class Database:
         source_ids = [sid for sid in source_person_ids if sid != target_person_id]
         if not source_ids:
             return self.get_person_summary(target_person_id)
+
+        preserved_centroids: list[np.ndarray] = []
         with self.connection() as conn:
+            involved_ids = [target_person_id, *source_ids]
+            for pid in involved_ids:
+                det_count = conn.execute(
+                    "SELECT COUNT(*) as c FROM detections WHERE person_id = ?", (pid,)
+                ).fetchone()["c"]
+                if det_count == 0:
+                    row = conn.execute(
+                        "SELECT centroid FROM persons WHERE id = ?", (pid,)
+                    ).fetchone()
+                    if row:
+                        emb = decode_embedding(row["centroid"])
+                        if emb is not None:
+                            preserved_centroids.append(emb)
+
             for sid in source_ids:
                 conn.execute(
                     "UPDATE detections SET person_id = ? WHERE person_id = ?",
                     (target_person_id, sid),
                 )
                 conn.execute("DELETE FROM persons WHERE id = ?", (sid,))
+
         self.recompute_person_stats(target_person_id)
+
+        if preserved_centroids:
+            with self.connection() as conn:
+                remaining_dets = conn.execute(
+                    "SELECT COUNT(*) as c FROM detections WHERE person_id = ?",
+                    (target_person_id,),
+                ).fetchone()["c"]
+                row = conn.execute(
+                    "SELECT centroid FROM persons WHERE id = ?", (target_person_id,)
+                ).fetchone()
+                cur_emb = decode_embedding(row["centroid"]) if row else None
+                if remaining_dets == 0:
+                    merged_centroid = np.sum(preserved_centroids, axis=0)
+                    conn.execute(
+                        "UPDATE persons SET centroid = ?, updated_at = ? WHERE id = ?",
+                        (encode_embedding(merged_centroid), utc_now_iso(), target_person_id),
+                    )
+                elif cur_emb is not None:
+                    preserved_mean = np.mean(preserved_centroids, axis=0)
+                    blended = cur_emb * 0.7 + preserved_mean * 0.3
+                    conn.execute(
+                        "UPDATE persons SET centroid = ?, updated_at = ? WHERE id = ?",
+                        (encode_embedding(blended), utc_now_iso(), target_person_id),
+                    )
+
         return self.get_person_summary(target_person_id)
 
     def delete_person(self, person_id: str) -> None:

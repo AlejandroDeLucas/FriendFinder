@@ -563,4 +563,27 @@ def test_clear_person_photos_preserves_identity_and_recognition(isolated_env):
     assert matched_name == "Carlos"
 
 
+def test_merge_persons_preserves_photoless_centroid(isolated_env):
+    """Verify merging a photo-less saved identity with another person preserves facial embeddings cleanly."""
+    db = isolated_env["db"]
+    client = isolated_env["client"]
 
+    emb_a = np.zeros(512, dtype=np.float32)
+    emb_a[10] = 1.0
+    emb_b = np.zeros(512, dtype=np.float32)
+    emb_b[11] = 1.0
+
+    person_a = db.create_person("Elena", centroid=emb_a)
+    person_b = db.create_person("Persona 2", centroid=emb_b)
+
+    # Merge two photo-less identities -> centroid should combine both instead of becoming NULL
+    res = client.post(
+        f"/api/persons/{person_a['id']}/merge",
+        json={"source_person_ids": [person_b["id"]]},
+    )
+    assert res.status_code == 200
+    embs = {pid: vec for pid, _name, vec in db.get_all_person_embeddings()}
+    assert person_a["id"] in embs
+    assert person_b["id"] not in embs
+    assert embs[person_a["id"]][10] > 0.5
+    assert embs[person_a["id"]][11] > 0.5

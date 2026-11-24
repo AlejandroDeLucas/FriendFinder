@@ -649,7 +649,37 @@ export async function mergeBrowserPersons(
   sourceIds: string[]
 ): Promise<PersonSummary> {
   const cleanSources = new Set(sourceIds.filter((s) => s !== targetId));
+  if (cleanSources.size === 0) {
+    return getBrowserPersonDetail(targetId);
+  }
+
   const allDets = await getAllStoredDetections();
+  const detCountByPerson = new Map<string, number>();
+  for (const d of allDets) {
+    if (d.person_id) {
+      detCountByPerson.set(d.person_id, (detCountByPerson.get(d.person_id) || 0) + 1);
+    }
+  }
+
+  // Collect saved facial vectors from any involved profile that has 0 photos so no saved identity is lost
+  const preservedVectors: number[][] = [];
+  const collectSaved = (p: StoredPerson | null) => {
+    if (!p) return;
+    if ((detCountByPerson.get(p.id) || 0) > 0) return;
+    if (Array.isArray(p.reference_embeddings) && p.reference_embeddings.length > 0) {
+      for (const vec of p.reference_embeddings) {
+        if (Array.isArray(vec) && vec.length > 0) preservedVectors.push([...vec]);
+      }
+    } else if (Array.isArray(p.centroid) && p.centroid.length > 0) {
+      preservedVectors.push([...p.centroid]);
+    }
+  };
+
+  collectSaved(await getStoredPerson(targetId));
+  for (const sid of cleanSources) {
+    collectSaved(await getStoredPerson(sid));
+  }
+
   for (const d of allDets) {
     if (d.person_id && cleanSources.has(d.person_id)) {
       await saveDetection({ ...d, person_id: targetId });
@@ -659,6 +689,52 @@ export async function mergeBrowserPersons(
     await idbDelete('persons', sid);
   }
   await recomputeBrowserPersonStats(targetId);
+
+  if (preservedVectors.length > 0) {
+    const updatedTarget = await getStoredPerson(targetId);
+    if (updatedTarget) {
+      const existingRefs =
+        Array.isArray(updatedTarget.reference_embeddings) &&
+        updatedTarget.reference_embeddings.length > 0
+          ? updatedTarget.reference_embeddings
+          : updatedTarget.centroid && updatedTarget.centroid.length > 0
+            ? [updatedTarget.centroid]
+            : [];
+
+      const combinedRefs: number[][] = [...existingRefs];
+      for (const vec of preservedVectors) {
+        const isDuplicate = combinedRefs.some(
+          (ref) => ref.length === vec.length && ref.every((v, i) => Math.abs(v - vec[i]) < 1e-6)
+        );
+        if (!isDuplicate && combinedRefs.length < 8) {
+          combinedRefs.push(vec);
+        }
+      }
+
+      let nextCentroid = updatedTarget.centroid;
+      const targetDetCount =
+        (detCountByPerson.get(targetId) || 0) +
+        Array.from(cleanSources).reduce((acc, sid) => acc + (detCountByPerson.get(sid) || 0), 0);
+      if (targetDetCount === 0 && combinedRefs.length > 0) {
+        const dim = combinedRefs[0].length;
+        const avg = new Array<number>(dim).fill(0);
+        for (const vec of combinedRefs) {
+          if (vec.length === dim) {
+            for (let i = 0; i < dim; i++) avg[i] += vec[i] / combinedRefs.length;
+          }
+        }
+        nextCentroid = avg;
+      }
+
+      await savePerson({
+        ...updatedTarget,
+        centroid: nextCentroid,
+        reference_embeddings: combinedRefs,
+        updated_at: new Date().toISOString(),
+      });
+    }
+  }
+
   return getBrowserPersonDetail(targetId);
 }
 
