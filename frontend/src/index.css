@@ -1093,6 +1093,12 @@ kbd {
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.media-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px hsla(16, 66%, 47%, 0.2);
 }
 
 .media-card-thumb {

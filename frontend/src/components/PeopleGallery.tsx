@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowRight,
   Check,
@@ -224,10 +224,60 @@ export function PeopleGallery({
     p.name.toLowerCase().includes(query.trim().toLowerCase())
   );
 
-  const toggleSelect = (id: string) => {
+  const lastSelectedIdRef = useRef<string | null>(null);
+
+  const toggleSelect = (
+    id: string,
+    e?: { shiftKey?: boolean; preventDefault?: () => void }
+  ) => {
+    if (e?.shiftKey) {
+      e.preventDefault?.();
+      window.getSelection()?.removeAllRanges();
+      const currentIdx = filtered.findIndex((p) => p.id === id);
+      let anchorId = lastSelectedIdRef.current;
+      if (!anchorId || !filtered.some((p) => p.id === anchorId)) {
+        const lastExisting = [...selectedIds]
+          .reverse()
+          .find((sid) => filtered.some((p) => p.id === sid));
+        anchorId = lastExisting || null;
+      }
+      const anchorIdx = anchorId ? filtered.findIndex((p) => p.id === anchorId) : -1;
+
+      if (currentIdx !== -1 && anchorIdx !== -1) {
+        const start = Math.min(anchorIdx, currentIdx);
+        const end = Math.max(anchorIdx, currentIdx);
+        const rangeIds = filtered.slice(start, end + 1).map((p) => p.id);
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          for (const rid of rangeIds) next.add(rid);
+          return Array.from(next);
+        });
+        lastSelectedIdRef.current = id;
+        return;
+      }
+    }
+
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     );
+    lastSelectedIdRef.current = id;
+  };
+
+  const handleSelectAllFiltered = () => {
+    setSelectedIds(filtered.map((p) => p.id));
+    if (filtered.length > 0) {
+      lastSelectedIdRef.current = filtered[filtered.length - 1].id;
+    }
+  };
+
+  const handleCardClick = (personId: string, e: React.MouseEvent) => {
+    if (Date.now() < justDraggedUntilRef.current) return;
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      toggleSelect(personId, e);
+      return;
+    }
+    onSelectPerson(personId);
   };
 
   const handleMerge = async () => {
@@ -249,6 +299,7 @@ export function PeopleGallery({
     try {
       await api.mergePersons(targetId, sources);
       setSelectedIds([]);
+      lastSelectedIdRef.current = null;
       onToast(`Perfiles fusionados en "${targetName}"`);
       onRefresh();
     } catch (err) {
@@ -278,10 +329,11 @@ export function PeopleGallery({
   };
 
   const handleDeleteSelected = async () => {
-    if (selectedIds.length === 0) return;
+    if (selectedIds.length === 0 || busy) return;
+    const count = selectedIds.length;
     if (
       !window.confirm(
-        `¿Eliminar ${selectedIds.length} perfil(es) seleccionado(s)? (Útil para quitar desconocidos del fondo)`
+        `¿Eliminar ${count} perfil(es) seleccionado(s)? (Útil para quitar desconocidos del fondo)`
       )
     ) {
       return;
@@ -292,7 +344,8 @@ export function PeopleGallery({
         await api.deletePerson(id);
       }
       setSelectedIds([]);
-      onToast('Perfiles eliminados');
+      lastSelectedIdRef.current = null;
+      onToast(`${count} perfil(es) eliminado(s)`);
       onRefresh();
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error al eliminar');
@@ -300,6 +353,29 @@ export function PeopleGallery({
       setBusy(false);
     }
   };
+
+  useEffect(() => {
+    if (selectedIds.length === 0) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (pendingMerge || editingId || busy) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key === 'Escape') {
+        setSelectedIds([]);
+        lastSelectedIdRef.current = null;
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        void handleDeleteSelected();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
 
   const handleRecluster = async () => {
     setBusy(true);
@@ -439,7 +515,7 @@ export function PeopleGallery({
             style={{ marginLeft: 'auto', color: 'var(--ink-secondary)', fontSize: '0.8rem' }}
           >
             <GitMerge size={14} style={{ color: 'var(--accent)' }} />
-            Arrastra una persona sobre otra para indicar que son la misma
+            Arrastra para unir · <strong>Shift + clic</strong> para seleccionar varios
           </span>
         )}
       </div>
@@ -461,8 +537,28 @@ export function PeopleGallery({
         >
           <span style={{ fontWeight: 600, color: 'var(--accent-ink)' }}>
             {selectedIds.length} persona(s) seleccionada(s)
+            <span
+              style={{
+                fontWeight: 400,
+                fontSize: '0.78rem',
+                marginLeft: 8,
+                opacity: 0.85,
+              }}
+            >
+              (Shift + clic para rango · Supr para eliminar)
+            </span>
           </span>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {selectedIds.length < filtered.length && (
+              <button
+                id="btn-select-all-people"
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={handleSelectAllFiltered}
+              >
+                Seleccionar todos ({filtered.length})
+              </button>
+            )}
             {selectedIds.length >= 2 && (
               <button
                 id="btn-merge-selected"
@@ -478,12 +574,16 @@ export function PeopleGallery({
               className="btn btn-danger btn-sm"
               disabled={busy}
               onClick={handleDeleteSelected}
+              title="Eliminar todos los perfiles seleccionados (también con tecla Supr / Borrar)"
             >
-              <Trash2 size={14} /> Eliminar seleccionados
+              <Trash2 size={14} /> Eliminar ({selectedIds.length})
             </button>
             <button
               className="btn btn-sm"
-              onClick={() => setSelectedIds([])}
+              onClick={() => {
+                setSelectedIds([]);
+                lastSelectedIdRef.current = null;
+              }}
             >
               Cancelar
             </button>
@@ -505,6 +605,9 @@ export function PeopleGallery({
               key={person.id}
               data-person-id={person.id}
               draggable={canDrag}
+              onMouseDown={(e) => {
+                if (e.shiftKey) e.preventDefault();
+              }}
               onDragStart={(e) => {
                 if (!canDrag) {
                   e.preventDefault();
@@ -550,10 +653,7 @@ export function PeopleGallery({
             >
               <div
                 className={`person-card-media ${showCutout ? 'checkerboard-bg cutout-preview' : ''}`}
-                onClick={() => {
-                  if (Date.now() < justDraggedUntilRef.current) return;
-                  onSelectPerson(person.id);
-                }}
+                onClick={(e) => handleCardClick(person.id, e)}
               >
                 {imgSrc ? (
                   <img src={imgSrc} alt={person.name} loading="lazy" draggable={false} />
@@ -601,9 +701,10 @@ export function PeopleGallery({
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <button
                       aria-label={`Seleccionar ${person.name}`}
+                      title="Clic para seleccionar · Shift + clic para seleccionar un rango"
                       onClick={(e) => {
                         e.stopPropagation();
-                        toggleSelect(person.id);
+                        toggleSelect(person.id, e);
                       }}
                       style={{
                         width: 26,
@@ -663,9 +764,8 @@ export function PeopleGallery({
               <div
                 className="person-card-body"
                 style={{ cursor: editingId === person.id ? 'default' : 'pointer' }}
-                onClick={() => {
-                  if (Date.now() < justDraggedUntilRef.current) return;
-                  if (editingId !== person.id) onSelectPerson(person.id);
+                onClick={(e) => {
+                  if (editingId !== person.id) handleCardClick(person.id, e);
                 }}
               >
                 {editingId === person.id ? (
