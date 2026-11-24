@@ -740,10 +740,21 @@ export async function mergeBrowserPersons(
 
 export async function deleteBrowserPerson(personId: string): Promise<{ deleted: boolean }> {
   const allDets = await getAllStoredDetections();
-  for (const d of allDets) {
-    if (d.person_id === personId) {
-      await idbDelete('detections', d.id);
+  const toDelete = allDets.filter((d) => d.person_id === personId);
+  const remainingFrameKeys = new Set(
+    allDets
+      .filter((d) => d.person_id !== personId && d.frame_path)
+      .map((d) => d.frame_path as string)
+  );
+
+  for (const d of toDelete) {
+    for (const key of [d.portrait_path, d.cutout_path, d.crop_path, d.thumb_path]) {
+      if (key) await deleteBlob(key);
     }
+    if (d.frame_path && !remainingFrameKeys.has(d.frame_path)) {
+      await deleteBlob(d.frame_path);
+    }
+    await idbDelete('detections', d.id);
   }
   await idbDelete('persons', personId);
   return { deleted: true };

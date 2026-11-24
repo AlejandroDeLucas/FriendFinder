@@ -77,10 +77,30 @@ export function App() {
         api.getStats(),
         api.getSettings(),
       ]);
-      setPersons(Array.isArray(pList) ? pList : []);
-      setMedia(Array.isArray(mList) ? mList : []);
+      const nextPersons = Array.isArray(pList) ? pList : [];
+      const nextMedia = Array.isArray(mList) ? mList : [];
+      setPersons(nextPersons);
+      setMedia(nextMedia);
       setStats(sData);
       setSettings(setRes.settings);
+
+      // Keep lastFinishedJob summary synced with live persons/media so deleted people disappear immediately
+      setLastFinishedJob((prev) => {
+        if (!prev?.summary) return prev;
+        const livePersonIds = new Set(nextPersons.map((p) => p.id));
+        const liveMediaIds = new Set(nextMedia.map((m) => m.id));
+        const remainingDetected = (prev.summary.detected_persons || []).filter((dp) =>
+          livePersonIds.has(dp.id)
+        );
+        const remainingMedia = (prev.summary.media_results || []).filter((mr) =>
+          liveMediaIds.has(mr.media_id)
+        );
+        if (remainingDetected.length === 0 && remainingMedia.length === 0) {
+          return null;
+        }
+        return prev;
+      });
+
       if (!activeJobId && Array.isArray(sData?.active_jobs) && sData.active_jobs.length > 0) {
         setActiveJobId(sData.active_jobs[0].id);
         setActiveJob(sData.active_jobs[0]);
@@ -374,9 +394,11 @@ export function App() {
           <UploadStudio
             activeJob={activeJob}
             lastFinishedJob={lastFinishedJob}
+            persons={persons}
             defaultSampleFps={Number(settings?.video_sample_fps || '1.0')}
             retentionMinutes={Number(settings?.source_retention_minutes || '60')}
             onJobStarted={(jobId) => setActiveJobId(jobId)}
+            onDismissSummary={() => setLastFinishedJob(null)}
             onGoPeople={() => navigateTab('people')}
             onPersonsUpdated={refreshAll}
             onToast={showToast}

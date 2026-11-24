@@ -9,6 +9,7 @@ import {
   Layers,
   Pin,
   Sparkles,
+  Trash2,
   Upload,
   UserCheck,
   X,
@@ -16,14 +17,16 @@ import {
 } from 'lucide-react';
 import { api, assetUrl, formatBytes } from '../api';
 import { extractImagesFromPasteEvent, readImagesFromClipboardApi } from '../clipboard';
-import type { JobInfo } from '../types';
+import type { JobInfo, PersonSummary } from '../types';
 
 interface Props {
   activeJob: JobInfo | null;
   lastFinishedJob: JobInfo | null;
+  persons: PersonSummary[];
   defaultSampleFps: number;
   retentionMinutes: number;
   onJobStarted: (jobId: string) => void;
+  onDismissSummary: () => void;
   onGoPeople: () => void;
   onPersonsUpdated: () => void;
   onToast: (msg: string) => void;
@@ -32,9 +35,11 @@ interface Props {
 export function UploadStudio({
   activeJob,
   lastFinishedJob,
+  persons,
   defaultSampleFps,
   retentionMinutes,
   onJobStarted,
+  onDismissSummary,
   onGoPeople,
   onPersonsUpdated,
   onToast,
@@ -48,6 +53,9 @@ export function UploadStudio({
   const [uploading, setUploading] = useState(false);
   const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
   const [savedNames, setSavedNames] = useState<Record<string, string>>({});
+  const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
+
+  const livePersonMap = new Map(persons.map((p) => [p.id, p]));
 
   const handleSavePersonName = async (personId: string, fallbackName: string) => {
     const nextName = (nameDrafts[personId] ?? fallbackName).trim();
@@ -59,6 +67,23 @@ export function UploadStudio({
       onPersonsUpdated();
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error guardando nombre');
+    }
+  };
+
+  const handleDeleteSummaryPerson = async (personId: string, name: string) => {
+    setDeletingIds((prev) => new Set(prev).add(personId));
+    try {
+      await api.deletePerson(personId);
+      onToast(`"${name}" eliminado.`);
+      onPersonsUpdated();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error al eliminar persona');
+    } finally {
+      setDeletingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(personId);
+        return next;
+      });
     }
   };
 
@@ -339,36 +364,51 @@ export function UploadStudio({
         </div>
       )}
 
-      {lastFinishedJob?.summary && (
-        <div className="panel">
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              flexWrap: 'wrap',
-              gap: 12,
-              marginBottom: 16,
-            }}
-          >
-            <div>
-              <h2 className="section-title" style={{ marginBottom: 4 }}>
-                Resumen del filtrado inteligente
-              </h2>
-              <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--ink-secondary)' }}>
-                {lastFinishedJob.summary.total_frames_analyzed} frames analizados ·{' '}
-                <strong>{lastFinishedJob.summary.kept_detections} mejores capturas</strong>{' '}
-                extraídas · {lastFinishedJob.summary.discarded_detections} descartadas ·{' '}
-                {lastFinishedJob.summary.new_persons} persona(s) nueva(s)
-              </p>
+      {lastFinishedJob?.summary && (() => {
+        const liveDetected = (lastFinishedJob.summary.detected_persons || []).filter(
+          (dp) => livePersonMap.has(dp.id) && !deletingIds.has(dp.id)
+        );
+        return (
+          <div className="panel">
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                gap: 12,
+                marginBottom: 16,
+              }}
+            >
+              <div>
+                <h2 className="section-title" style={{ marginBottom: 4 }}>
+                  Resumen del filtrado inteligente
+                </h2>
+                <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--ink-secondary)' }}>
+                  {lastFinishedJob.summary.total_frames_analyzed} frames analizados ·{' '}
+                  <strong>{lastFinishedJob.summary.kept_detections} mejores capturas</strong>{' '}
+                  extraídas · {lastFinishedJob.summary.discarded_detections} descartadas ·{' '}
+                  {liveDetected.length} persona(s) activa(s)
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {liveDetected.length > 0 && (
+                  <button id="btn-go-people-after-upload" className="btn btn-dark" onClick={onGoPeople}>
+                    <Layers size={15} /> Ver personas extraídas
+                  </button>
+                )}
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={onDismissSummary}
+                  title="Cerrar resumen"
+                  aria-label="Cerrar resumen"
+                >
+                  <X size={16} />
+                </button>
+              </div>
             </div>
-            <button id="btn-go-people-after-upload" className="btn btn-dark" onClick={onGoPeople}>
-              <Layers size={15} /> Ver personas extraídas
-            </button>
-          </div>
 
-          {lastFinishedJob.summary.detected_persons &&
-            lastFinishedJob.summary.detected_persons.length > 0 && (
+            {liveDetected.length > 0 && (
               <div style={{ marginBottom: 18 }}>
                 <div
                   style={{
@@ -387,8 +427,9 @@ export function UploadStudio({
                     gap: 10,
                   }}
                 >
-                  {lastFinishedJob.summary.detected_persons.map((dp) => {
-                    const currentName = savedNames[dp.id] || dp.name;
+                  {liveDetected.map((dp) => {
+                    const livePerson = livePersonMap.get(dp.id);
+                    const currentName = savedNames[dp.id] || livePerson?.name || dp.name;
                     const isDefault = /^Persona \d+$/.test(currentName);
                     const draftVal =
                       nameDrafts[dp.id] !== undefined
@@ -397,7 +438,10 @@ export function UploadStudio({
                           ? ''
                           : currentName;
                     const thumbSrc =
-                      assetUrl.portrait(dp.thumb_path) || assetUrl.thumb(dp.thumb_path);
+                      assetUrl.portrait(livePerson?.cover_detection?.portrait_path) ||
+                      assetUrl.thumb(livePerson?.cover_detection?.thumb_path) ||
+                      assetUrl.portrait(dp.thumb_path) ||
+                      assetUrl.thumb(dp.thumb_path);
 
                     return (
                       <div
@@ -471,6 +515,15 @@ export function UploadStudio({
                             >
                               <Check size={14} />
                             </button>
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              style={{ padding: '5px 7px', color: 'var(--danger)' }}
+                              onClick={() => void handleDeleteSummaryPerson(dp.id, currentName)}
+                              title="Eliminar esta persona"
+                              aria-label={`Eliminar a ${currentName}`}
+                            >
+                              <Trash2 size={14} />
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -524,9 +577,10 @@ export function UploadStudio({
                 </div>
               );
             })}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </section>
   );
 }
