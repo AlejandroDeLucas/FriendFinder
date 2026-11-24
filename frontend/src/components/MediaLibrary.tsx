@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Film, Image as ImageIcon, Play, Trash2, Upload } from 'lucide-react';
-import { api, assetUrl, formatBytes, formatTime } from '../api';
+import { Clock, Film, Image as ImageIcon, Pin, Play, Trash2, Upload } from 'lucide-react';
+import { api, assetUrl, formatBytes, formatTime, formatTimeRemaining } from '../api';
 import type { MediaItem } from '../types';
 
 interface Props {
@@ -21,6 +21,7 @@ export function MediaLibrary({
   onToast,
 }: Props) {
   const [filter, setFilter] = useState<'all' | 'video' | 'image' | 'useful' | 'discarded'>('all');
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const filtered = media.filter((m) => {
     if (filter === 'video') return m.media_type === 'video';
@@ -30,9 +31,27 @@ export function MediaLibrary({
     return true;
   });
 
+  const handleToggleKeep = async (item: MediaItem) => {
+    setBusyId(item.id);
+    try {
+      const nextKeep = !item.keep_forever;
+      await api.setMediaRetention(item.id, nextKeep);
+      onToast(
+        nextKeep
+          ? `"${item.original_filename}" marcado para mantenerse sin caducidad.`
+          : `"${item.original_filename}" se auto-borrará en 1 hora (sus recortes se conservan).`
+      );
+      onRefresh();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error cambiando retención');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const handleDeleteSource = async (item: MediaItem, keepAssets: boolean) => {
     const msg = keepAssets
-      ? `¿Borrar el archivo original "${item.original_filename}" para liberar espacio?\n\nLas imágenes y recortes PNG de tus amigos ya extraídos SE CONSERVARÁN.`
+      ? `¿Borrar el archivo original "${item.original_filename}" ahora?\n\nLas imágenes y recortes PNG de tus amigos ya extraídos SE CONSERVARÁN.`
       : `¿Eliminar "${item.original_filename}" y TODAS las detecciones asociadas?`;
     if (!window.confirm(msg)) return;
     try {
@@ -52,8 +71,8 @@ export function MediaLibrary({
         </div>
         <h2>Biblioteca vacía</h2>
         <p>
-          Sube tus fotos y vídeos para indexar a todos tus amigos. Si mantienes los vídeos aquí,
-          podrás buscar cualquier foto y saltar al instante al segundo exacto donde aparece.
+          Sube tus fotos y vídeos para analizarlos. Por defecto los originales se limpian solos tras
+          1 hora (conservando siempre lo generado), o puedes pulsar «Mantener» en cualquier archivo.
         </p>
         <button className="btn btn-primary" onClick={onGoUpload}>
           <Upload size={16} /> Subir archivos
@@ -68,8 +87,9 @@ export function MediaLibrary({
         <div>
           <h1 className="page-title">Biblioteca de fotos y vídeos</h1>
           <p className="page-subtitle">
-            Reproduce vídeos con marcadores de personas o libera espacio borrando vídeos originales
-            sin perder los retratos y recortes PNG guardados.
+            Los originales expiran por defecto en 1 hora para ahorrar espacio (los retratos y
+            recortes PNG nunca se borran). Pulsa <strong>Mantener</strong> en los vídeos que
+            quieras conservar para reproducir y buscar por foto.
           </p>
         </div>
 
@@ -97,6 +117,9 @@ export function MediaLibrary({
       <div className="media-grid">
         {filtered.map((item) => {
           const deleted = Boolean(item.source_deleted);
+          const keepForever = Boolean(item.keep_forever);
+          const remaining = !deleted && !keepForever ? formatTimeRemaining(item.expires_at) : null;
+
           return (
             <article key={item.id} className="media-card">
               <div
@@ -106,7 +129,11 @@ export function MediaLibrary({
                 }}
               >
                 {item.thumb_path ? (
-                  <img src={assetUrl.thumb(item.thumb_path)} alt={item.original_filename} loading="lazy" />
+                  <img
+                    src={assetUrl.thumb(item.thumb_path)}
+                    alt={item.original_filename}
+                    loading="lazy"
+                  />
                 ) : (
                   <div
                     style={{
@@ -150,6 +177,20 @@ export function MediaLibrary({
                           : 'Procesando'}
                   </span>
                 </div>
+
+                <div className="card-overlay-bottom">
+                  {deleted ? (
+                    <span className="badge badge-dark">Original borrado · Recortes OK</span>
+                  ) : keepForever ? (
+                    <span className="badge badge-success">
+                      <Pin size={11} /> Guardado
+                    </span>
+                  ) : (
+                    <span className="badge badge-warning">
+                      <Clock size={11} /> {remaining ? `Expira en ${remaining}` : 'Temporal 1h'}
+                    </span>
+                  )}
+                </div>
               </div>
 
               <div className="media-card-body">
@@ -192,31 +233,47 @@ export function MediaLibrary({
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
+                    gap: 6,
                     borderTop: '1px solid var(--border-hairline)',
                     fontSize: '0.76rem',
                     color: 'var(--ink-muted)',
                   }}
                 >
-                  <span>
-                    {formatBytes(item.file_size)}
-                    {deleted && ' · Original borrado'}
-                  </span>
-                  <div style={{ display: 'flex', gap: 4 }}>
+                  <span>{formatBytes(item.file_size)}</span>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    {!deleted && (
+                      <button
+                        className={`btn btn-sm ${keepForever ? 'btn-ghost' : 'btn-primary'}`}
+                        style={{ padding: '4px 9px', fontSize: '0.76rem' }}
+                        disabled={busyId === item.id}
+                        onClick={() => handleToggleKeep(item)}
+                      >
+                        {keepForever ? (
+                          <>
+                            <Clock size={12} /> 1h
+                          </>
+                        ) : (
+                          <>
+                            <Pin size={12} /> Mantener
+                          </>
+                        )}
+                      </button>
+                    )}
                     {!deleted && (
                       <button
                         className="btn btn-ghost btn-sm"
-                        style={{ padding: '4px 8px' }}
+                        style={{ padding: '4px 7px', fontSize: '0.75rem' }}
                         onClick={() => handleDeleteSource(item, true)}
-                        title="Borrar solo el archivo original (mantiene retratos y recortes PNG)"
+                        title="Borrar original ahora (mantiene retratos y recortes PNG)"
                       >
-                        Liberar espacio
+                        Limpiar
                       </button>
                     )}
                     <button
                       className="btn btn-ghost btn-sm"
                       style={{ padding: '4px 6px', color: 'var(--danger)' }}
                       onClick={() => handleDeleteSource(item, false)}
-                      title="Eliminar completamente de la biblioteca"
+                      title="Eliminar registro y detecciones"
                     >
                       <Trash2 size={14} />
                     </button>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Camera,
   Film,
+  Lock,
   Play,
   Search,
   Settings,
@@ -9,7 +10,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { api, assetUrl, formatTime } from './api';
+import { api, assetUrl, formatTime, getStoredPin, setStoredPin } from './api';
 import { MediaLibrary } from './components/MediaLibrary';
 import { PeopleGallery } from './components/PeopleGallery';
 import { PersonDetail } from './components/PersonDetail';
@@ -29,6 +30,12 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+
+  // Optional Cloudflare PIN access gate
+  const [pinRequired, setPinRequired] = useState(false);
+  const [pinUnlocked, setPinUnlocked] = useState(true);
+  const [pinInput, setPinInput] = useState('');
+  const [pinError, setPinError] = useState('');
 
   // Active background job polling
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
@@ -67,15 +74,62 @@ export function App() {
         setActiveJob(sData.active_jobs[0]);
       }
     } catch {
-      // Backend might still be starting up
+      // Backend might still be starting up or require PIN
     } finally {
       setLoading(false);
     }
   }, [activeJobId]);
 
+  // Check optional PIN lock first
   useEffect(() => {
-    void refreshAll();
+    let mounted = true;
+    api
+      .getAuthStatus()
+      .then(async (status) => {
+        if (!mounted) return;
+        if (!status.pin_required) {
+          setPinRequired(false);
+          setPinUnlocked(true);
+          void refreshAll();
+          return;
+        }
+        setPinRequired(true);
+        const existing = getStoredPin();
+        if (existing) {
+          try {
+            await api.verifyPin(existing);
+            if (!mounted) return;
+            setPinUnlocked(true);
+            void refreshAll();
+            return;
+          } catch {
+            setStoredPin('');
+          }
+        }
+        setPinUnlocked(false);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (mounted) void refreshAll();
+      });
+    return () => {
+      mounted = false;
+    };
   }, [refreshAll]);
+
+  const handlePinSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPinError('');
+    try {
+      await api.verifyPin(pinInput);
+      setStoredPin(pinInput);
+      setPinUnlocked(true);
+      setPinInput('');
+      void refreshAll();
+    } catch {
+      setPinError('PIN incorrecto. Inténtalo de nuevo.');
+    }
+  };
 
   // Poll active background job
   useEffect(() => {
@@ -146,23 +200,60 @@ export function App() {
     }
   };
 
+  const navigateTab = (next: Tab) => {
+    setSelectedPersonId(null);
+    setTab(next);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  if (pinRequired && !pinUnlocked) {
+    return (
+      <div className="pin-gate">
+        <form className="pin-card" onSubmit={handlePinSubmit}>
+          <div className="empty-studio-icon" style={{ marginBottom: 4 }}>
+            <Lock size={24} />
+          </div>
+          <h1 className="section-title" style={{ margin: 0, fontSize: '1.45rem' }}>
+            FriendFinder protegido
+          </h1>
+          <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--ink-secondary)' }}>
+            Introduce el PIN configurado en tu servidor para acceder desde este dispositivo.
+          </p>
+          <input
+            id="input-access-pin"
+            className="input"
+            type="password"
+            inputMode="numeric"
+            placeholder="PIN de acceso"
+            value={pinInput}
+            autoFocus
+            onChange={(e) => setPinInput(e.target.value)}
+            style={{ textAlign: 'center', fontSize: '1.1rem', letterSpacing: '0.18em' }}
+          />
+          {pinError && (
+            <div style={{ color: 'var(--danger)', fontSize: '0.83rem', fontWeight: 600 }}>
+              {pinError}
+            </div>
+          )}
+          <button id="btn-unlock-pin" type="submit" className="btn btn-primary" disabled={!pinInput.trim()}>
+            Entrar
+          </button>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-inner">
-          <button
-            className="brand"
-            onClick={() => {
-              setSelectedPersonId(null);
-              setTab('people');
-            }}
-          >
+          <button className="brand" onClick={() => navigateTab('people')}>
             <span className="brand-mark">
               <Camera size={18} />
             </span>
             <span>
               <span className="brand-name">FriendFinder</span>
-              <span className="brand-sub">Estudio local de personajes</span>
+              <span className="brand-sub">Estudio de personajes</span>
             </span>
           </button>
 
@@ -170,10 +261,7 @@ export function App() {
             <button
               id="nav-people"
               className={`nav-tab ${tab === 'people' && !selectedPersonId ? 'active' : ''}`}
-              onClick={() => {
-                setSelectedPersonId(null);
-                setTab('people');
-              }}
+              onClick={() => navigateTab('people')}
             >
               <Users size={15} />
               Personas
@@ -183,10 +271,7 @@ export function App() {
             <button
               id="nav-upload"
               className={`nav-tab ${tab === 'upload' && !selectedPersonId ? 'active' : ''}`}
-              onClick={() => {
-                setSelectedPersonId(null);
-                setTab('upload');
-              }}
+              onClick={() => navigateTab('upload')}
             >
               <Upload size={15} />
               Subir y filtrar
@@ -195,10 +280,7 @@ export function App() {
             <button
               id="nav-search"
               className={`nav-tab ${tab === 'search' && !selectedPersonId ? 'active' : ''}`}
-              onClick={() => {
-                setSelectedPersonId(null);
-                setTab('search');
-              }}
+              onClick={() => navigateTab('search')}
             >
               <Search size={15} />
               Buscar por foto
@@ -207,10 +289,7 @@ export function App() {
             <button
               id="nav-library"
               className={`nav-tab ${tab === 'library' && !selectedPersonId ? 'active' : ''}`}
-              onClick={() => {
-                setSelectedPersonId(null);
-                setTab('library');
-              }}
+              onClick={() => navigateTab('library')}
             >
               <Film size={15} />
               Biblioteca
@@ -223,7 +302,7 @@ export function App() {
               id="btn-open-settings"
               className="btn btn-icon"
               onClick={() => setShowSettings(true)}
-              title="Ajustes locales"
+              title="Ajustes"
             >
               <Settings size={17} />
             </button>
@@ -265,7 +344,7 @@ export function App() {
             persons={persons}
             loading={loading}
             onSelectPerson={(id) => setSelectedPersonId(id)}
-            onGoUpload={() => setTab('upload')}
+            onGoUpload={() => navigateTab('upload')}
             onRefresh={refreshAll}
             onToast={showToast}
           />
@@ -274,11 +353,9 @@ export function App() {
             activeJob={activeJob}
             lastFinishedJob={lastFinishedJob}
             defaultSampleFps={Number(settings?.video_sample_fps || '1.0')}
+            retentionMinutes={Number(settings?.source_retention_minutes || '60')}
             onJobStarted={(jobId) => setActiveJobId(jobId)}
-            onGoPeople={() => {
-              setSelectedPersonId(null);
-              setTab('people');
-            }}
+            onGoPeople={() => navigateTab('people')}
             onToast={showToast}
           />
         ) : tab === 'search' ? (
@@ -292,12 +369,44 @@ export function App() {
             media={media}
             onOpenMediaAt={openMediaAt}
             onSelectPerson={(id) => setSelectedPersonId(id)}
-            onGoUpload={() => setTab('upload')}
+            onGoUpload={() => navigateTab('upload')}
             onRefresh={refreshAll}
             onToast={showToast}
           />
         )}
       </main>
+
+      {/* Mobile-First Frosted Bottom Dock */}
+      <nav className="mobile-dock" aria-label="Navegación móvil">
+        <button
+          className={`mobile-dock-btn ${tab === 'people' || selectedPersonId ? 'active' : ''}`}
+          onClick={() => navigateTab('people')}
+        >
+          <Users size={19} />
+          <span>Personas</span>
+        </button>
+        <button
+          className={`mobile-dock-btn ${tab === 'upload' && !selectedPersonId ? 'active' : ''}`}
+          onClick={() => navigateTab('upload')}
+        >
+          <Upload size={19} />
+          <span>Subir</span>
+        </button>
+        <button
+          className={`mobile-dock-btn ${tab === 'search' && !selectedPersonId ? 'active' : ''}`}
+          onClick={() => navigateTab('search')}
+        >
+          <Search size={19} />
+          <span>Buscar</span>
+        </button>
+        <button
+          className={`mobile-dock-btn ${tab === 'library' && !selectedPersonId ? 'active' : ''}`}
+          onClick={() => navigateTab('library')}
+        >
+          <Film size={19} />
+          <span>Biblioteca</span>
+        </button>
+      </nav>
 
       {/* Media / Video Player Modal with clickable person timestamps */}
       {viewerMedia && (
@@ -333,14 +442,15 @@ export function App() {
               >
                 {viewerMedia.source_deleted ? (
                   <div style={{ padding: 48, color: 'var(--ink-inverse)', textAlign: 'center' }}>
-                    El archivo original fue borrado para liberar espacio, pero las capturas
-                    extraídas de las personas siguen guardadas en sus perfiles.
+                    El archivo original expiró o fue borrado, pero las capturas extraídas de las
+                    personas siguen guardadas en sus perfiles.
                   </div>
                 ) : viewerMedia.media_type === 'video' ? (
                   <video
                     ref={videoRef}
                     src={assetUrl.mediaStream(viewerMedia.id)}
                     controls
+                    playsInline
                     style={{ width: '100%', maxHeight: 460 }}
                   />
                 ) : (
@@ -355,7 +465,7 @@ export function App() {
               {viewerMedia.detections && viewerMedia.detections.length > 0 && (
                 <div>
                   <h3 style={{ margin: '0 0 10px', fontSize: '0.92rem' }}>
-                    Personas detectadas en este archivo (haz clic para saltar al instante):
+                    Personas detectadas (toca para saltar al instante):
                   </h3>
                   <div className="timestamp-chips">
                     {viewerMedia.detections.slice(0, 40).map((det) => (

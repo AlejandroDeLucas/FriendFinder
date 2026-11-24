@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator
 
@@ -87,6 +87,8 @@ class Database:
                     kept_count INTEGER NOT NULL DEFAULT 0,
                     discarded_count INTEGER NOT NULL DEFAULT 0,
                     source_deleted INTEGER NOT NULL DEFAULT 0,
+                    keep_forever INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     verdict TEXT NOT NULL DEFAULT 'pending',
                     verdict_reason TEXT,
@@ -159,6 +161,16 @@ class Database:
                 );
                 """
             )
+            # Safe migrations for pre-existing local databases
+            existing_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(media)").fetchall()
+            }
+            if "keep_forever" not in existing_cols:
+                conn.execute("ALTER TABLE media ADD COLUMN keep_forever INTEGER NOT NULL DEFAULT 0")
+            if "expires_at" not in existing_cols:
+                conn.execute("ALTER TABLE media ADD COLUMN expires_at TEXT")
+
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -273,18 +285,97 @@ class Database:
         media_type: str,
         file_path: str,
         file_size: int,
+        keep_forever: bool = False,
+        retention_minutes: int | None = None,
     ) -> dict[str, Any]:
-        now = utc_now_iso()
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        if retention_minutes is None:
+            retention_minutes = int(self.get_settings().get("source_retention_minutes", "60"))
+        expires_at = (
+            None
+            if keep_forever
+            else (now_dt + timedelta(minutes=max(1, retention_minutes))).isoformat()
+        )
         with self.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO media (id, original_filename, media_type, file_path, file_size, status, verdict, created_at)
-                VALUES (?, ?, ?, ?, ?, 'processing', 'pending', ?)
+                INSERT INTO media (
+                    id, original_filename, media_type, file_path, file_size,
+                    keep_forever, expires_at, status, verdict, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', 'pending', ?)
                 """,
-                (media_id, original_filename, media_type, file_path, file_size, now),
+                (
+                    media_id,
+                    original_filename,
+                    media_type,
+                    file_path,
+                    file_size,
+                    1 if keep_forever else 0,
+                    expires_at,
+                    now,
+                ),
             )
             row = conn.execute("SELECT * FROM media WHERE id = ?", (media_id,)).fetchone()
             return dict(row)
+
+    def set_media_retention(
+        self,
+        media_id: str,
+        *,
+        keep_forever: bool,
+        retention_minutes: int | None = None,
+    ) -> dict[str, Any] | None:
+        if retention_minutes is None:
+            retention_minutes = int(self.get_settings().get("source_retention_minutes", "60"))
+        expires_at = (
+            None
+            if keep_forever
+            else (datetime.now(timezone.utc) + timedelta(minutes=max(1, retention_minutes))).isoformat()
+        )
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE media SET keep_forever = ?, expires_at = ? WHERE id = ?",
+                (1 if keep_forever else 0, expires_at, media_id),
+            )
+            row = conn.execute("SELECT * FROM media WHERE id = ?", (media_id,)).fetchone()
+            return dict(row) if row else None
+
+    def purge_expired_sources(self, now_iso: str | None = None) -> dict[str, Any]:
+        """Delete expired uploaded source files ONLY; preserve all generated person portraits, PNG cutouts, and profiles."""
+        cutoff = now_iso or utc_now_iso()
+        purged_ids: list[str] = []
+        freed_bytes = 0
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, file_path, file_size
+                FROM media
+                WHERE source_deleted = 0
+                  AND keep_forever = 0
+                  AND status != 'processing'
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= ?
+                """,
+                (cutoff,),
+            ).fetchall()
+
+            for row in rows:
+                fp = Path(row["file_path"])
+                if fp.exists():
+                    try:
+                        freed_bytes += fp.stat().st_size
+                        fp.unlink()
+                    except OSError:
+                        pass
+                conn.execute(
+                    "UPDATE media SET source_deleted = 1, expires_at = NULL WHERE id = ?",
+                    (row["id"],),
+                )
+                purged_ids.append(row["id"])
+
+        return {"purged_count": len(purged_ids), "purged_ids": purged_ids, "freed_bytes": freed_bytes}
 
     def update_media(self, media_id: str, **kwargs: Any) -> None:
         if not kwargs:

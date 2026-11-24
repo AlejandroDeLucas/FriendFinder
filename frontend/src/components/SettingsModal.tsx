@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Cpu, Save, X } from 'lucide-react';
-import { api } from '../api';
+import { Cloud, Cpu, Save, X } from 'lucide-react';
+import { api, getApiBase, setApiBase } from '../api';
 import type { AppSettings, SystemStats } from '../types';
 
 interface Props {
@@ -12,6 +12,7 @@ interface Props {
 export function SettingsModal({ onClose, onSaved, onToast }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [device, setDevice] = useState<SystemStats['device'] | null>(null);
+  const [apiBaseDraft, setApiBaseDraft] = useState<string>(getApiBase());
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -25,7 +26,18 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
   }, []);
 
   const handleSave = async () => {
-    if (!settings) return;
+    const previousBase = getApiBase();
+    setApiBase(apiBaseDraft);
+
+    if (!settings) {
+      if (apiBaseDraft.trim() !== previousBase) {
+        onToast('URL de servidor guardada. Recargando...');
+        window.location.reload();
+      }
+      onClose();
+      return;
+    }
+
     setSaving(true);
     try {
       const res = await api.updateSettings({
@@ -35,13 +47,18 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
         max_portraits_per_person: Number(settings.max_portraits_per_person),
         max_fullbody_per_person: Number(settings.max_fullbody_per_person),
         min_video_gap_seconds: Number(settings.min_video_gap_seconds),
+        source_retention_minutes: Number(settings.source_retention_minutes || '60'),
         auto_scene_analysis: settings.auto_scene_analysis === 'true',
         scene_backend: settings.scene_backend,
         ollama_url: settings.ollama_url,
         ollama_model: settings.ollama_model,
       });
       onSaved(res.settings);
-      onToast('Ajustes locales guardados');
+      onToast('Ajustes guardados');
+      if (apiBaseDraft.trim().replace(/\/+$/, '') !== previousBase) {
+        window.location.reload();
+        return;
+      }
       onClose();
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error guardando ajustes');
@@ -56,10 +73,10 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
         <div className="modal-header">
           <div>
             <h2 className="section-title" style={{ margin: 0 }}>
-              Ajustes locales de FriendFinder
+              Ajustes de FriendFinder
             </h2>
             <div style={{ fontSize: '0.82rem', color: 'var(--ink-secondary)' }}>
-              100% local y privado — tus fotos y vídeos nunca salen de tu equipo
+              Procesamiento local/privado · Acceso móvil vía Cloudflare Tunnel o Pages
             </div>
           </div>
           <button className="btn btn-ghost btn-icon" onClick={onClose}>
@@ -81,10 +98,11 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
                 fontSize: '0.84rem',
               }}
             >
-              <Cpu size={17} style={{ color: 'var(--accent)' }} />
+              <Cpu size={17} style={{ color: 'var(--accent)', flexShrink: 0 }} />
               <span>
-                Aceleración detectada: <strong className="mono">{device.torch_device.toUpperCase()}</strong> ·
-                ONNX <strong className="mono">{device.onnx_provider}</strong>
+                Aceleración detectada:{' '}
+                <strong className="mono">{device.torch_device.toUpperCase()}</strong> · ONNX{' '}
+                <strong className="mono">{device.onnx_provider}</strong>
               </span>
             </div>
           )}
@@ -92,6 +110,24 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
           {settings && (
             <>
               <div className="field-grid">
+                <div className="field">
+                  <label>Auto-borrado de archivos subidos (minutos)</label>
+                  <input
+                    className="input"
+                    type="number"
+                    min="5"
+                    max="10080"
+                    value={settings.source_retention_minutes || '60'}
+                    onChange={(e) =>
+                      setSettings({ ...settings, source_retention_minutes: e.target.value })
+                    }
+                  />
+                  <span className="field-hint">
+                    60 min (1 hora) por defecto. Solo borra el original subido, nunca los recortes
+                    generados.
+                  </span>
+                </div>
+
                 <div className="field">
                   <label>Frames por segundo en vídeos (FPS)</label>
                   <input
@@ -121,7 +157,9 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
                       setSettings({ ...settings, similarity_threshold: e.target.value })
                     }
                   />
-                  <span className="field-hint">0.45 por defecto. Sube si mezcla personas parecidas.</span>
+                  <span className="field-hint">
+                    0.45 por defecto. Sube si mezcla personas parecidas.
+                  </span>
                 </div>
 
                 <div className="field">
@@ -136,23 +174,9 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
                       setSettings({ ...settings, min_quality_score: e.target.value })
                     }
                   />
-                  <span className="field-hint">Capturas por debajo se descartan automáticamente.</span>
-                </div>
-
-                <div className="field">
-                  <label>Separación mínima entre frames de vídeo (seg)</label>
-                  <input
-                    className="input"
-                    type="number"
-                    step="0.5"
-                    min="0"
-                    max="20"
-                    value={settings.min_video_gap_seconds}
-                    onChange={(e) =>
-                      setSettings({ ...settings, min_video_gap_seconds: e.target.value })
-                    }
-                  />
-                  <span className="field-hint">Evita guardar 10 frames casi idénticos seguidos.</span>
+                  <span className="field-hint">
+                    Capturas por debajo se descartan automáticamente.
+                  </span>
                 </div>
 
                 <div className="field">
@@ -170,7 +194,7 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
                 </div>
 
                 <div className="field">
-                  <label>Máximo mejores cuerpos enteros / PNG por persona</label>
+                  <label>Máximo mejores cuerpos / PNG por persona</label>
                   <input
                     className="input"
                     type="number"
@@ -215,7 +239,9 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
                       <option value="blip">
                         BLIP local offline (HuggingFace ~990 MB la primera vez)
                       </option>
-                      <option value="ollama">Ollama local (llava / moondream / llama3.2-vision)</option>
+                      <option value="ollama">
+                        Ollama local (llava / moondream / llama3.2-vision)
+                      </option>
                     </select>
                   </div>
 
@@ -261,6 +287,43 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
               </div>
             </>
           )}
+
+          {/* Optional Remote Backend URL for Cloudflare Pages mode */}
+          <div
+            style={{
+              borderTop: '1px solid var(--border-hairline)',
+              paddingTop: 16,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+            }}
+          >
+            <h3
+              style={{
+                margin: 0,
+                fontSize: '0.94rem',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 7,
+              }}
+            >
+              <Cloud size={16} style={{ color: 'var(--accent)' }} />
+              Conexión Cloudflare (opcional)
+            </h3>
+            <div className="field">
+              <label>URL del backend (solo si alojas el frontend en Cloudflare Pages)</label>
+              <input
+                className="input"
+                placeholder="Dejar vacío para el mismo servidor (ej. https://tu-tunel.trycloudflare.com)"
+                value={apiBaseDraft}
+                onChange={(e) => setApiBaseDraft(e.target.value)}
+              />
+              <span className="field-hint">
+                Si usas <code>./run-cloudflare.sh</code>, déjalo vacío: todo funciona desde una
+                sola URL HTTPS.
+              </span>
+            </div>
+          </div>
         </div>
 
         <div className="modal-footer">
@@ -270,7 +333,7 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
           <button
             id="btn-save-settings"
             className="btn btn-primary"
-            disabled={saving || !settings}
+            disabled={saving}
             onClick={handleSave}
           >
             <Save size={15} /> {saving ? 'Guardando...' : 'Guardar ajustes'}

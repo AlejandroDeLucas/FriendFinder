@@ -35,10 +35,19 @@ class SettingsUpdateRequest(BaseModel):
     max_portraits_per_person: int | None = Field(default=None, ge=1, le=50)
     max_fullbody_per_person: int | None = Field(default=None, ge=1, le=50)
     min_video_gap_seconds: float | None = Field(default=None, ge=0.0, le=30.0)
+    source_retention_minutes: int | None = Field(default=None, ge=5, le=10080)
     auto_scene_analysis: bool | None = None
     scene_backend: str | None = Field(default=None, pattern="^(heuristic|blip|ollama)$")
     ollama_url: str | None = None
     ollama_model: str | None = None
+
+
+class MediaRetentionRequest(BaseModel):
+    keep_forever: bool
+
+
+class PinVerifyRequest(BaseModel):
+    pin: str
 
 
 class SceneAnalyzeRequest(BaseModel):

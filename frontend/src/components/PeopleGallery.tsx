@@ -206,6 +206,21 @@ export function PeopleGallery({
         </div>
       </header>
 
+      <div className="studio-strip">
+        <span className="studio-strip-item">
+          <Users size={15} style={{ color: 'var(--accent)' }} />
+          <strong>{persons.length}</strong> persona(s)
+        </span>
+        <span className="studio-strip-item">
+          <ImageIcon size={15} style={{ color: 'var(--success)' }} />
+          <strong>{persons.reduce((a, p) => a + p.kept_count, 0)}</strong> mejores capturas
+        </span>
+        <span className="studio-strip-item">
+          <Scissors size={15} style={{ color: 'var(--ink-primary)' }} />
+          <strong>{persons.reduce((a, p) => a + p.cutout_count, 0)}</strong> recortes PNG sin fondo
+        </span>
+      </div>
+
       {selectedIds.length > 0 && (
         <div
           className="panel"

@@ -48,7 +48,7 @@ export function SearchByPhoto({ onSelectPerson, onOpenMediaAt, onToast }: Props)
         </div>
       </header>
 
-      <div className="panel" style={{ display: 'grid', gridTemplateColumns: 'minmax(240px, 340px) 1fr', gap: 22 }}>
+      <div className="panel search-layout">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div
             id="search-dropzone"

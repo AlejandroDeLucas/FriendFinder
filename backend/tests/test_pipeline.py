@@ -332,3 +332,83 @@ def test_full_ml_end_to_end_photo_video_search_export(isolated_env, tmp_path: Pa
     assert not m3_dest.exists()
     assert (dirs["PORTRAITS_DIR"] / det["portrait_path"]).exists()
     assert db.get_media("m3")["source_deleted"] == 1
+
+
+def test_one_hour_source_retention_and_pin_guard(isolated_env, monkeypatch: pytest.MonkeyPatch):
+    """Verify default 1h expiration deletes ONLY uploaded source files (preserving generated assets),
+    Mantener prevents deletion, and optional Cloudflare PIN protects API/media routes.
+    """
+    from datetime import datetime, timedelta, timezone
+    import app.config as cfg
+
+    db = isolated_env["db"]
+    dirs = isolated_env["dirs"]
+    client = isolated_env["client"]
+
+    # 1. Create two finished uploaded source files + a generated portrait asset
+    ephemeral_src = dirs["UPLOADS_DIR"] / "temp_video.mp4"
+    ephemeral_src.write_bytes(b"fake-video-bytes-12345")
+    kept_src = dirs["UPLOADS_DIR"] / "saved_video.mp4"
+    kept_src.write_bytes(b"fake-video-bytes-keep")
+
+    generated_portrait = dirs["PORTRAITS_DIR"] / "det1_portrait.jpg"
+    generated_portrait.write_bytes(b"generated-portrait-bytes")
+
+    m_temp = db.create_media(
+        media_id="temp1",
+        original_filename="temp_video.mp4",
+        media_type="video",
+        file_path=str(ephemeral_src),
+        file_size=ephemeral_src.stat().st_size,
+    )
+    assert m_temp["keep_forever"] == 0
+    assert m_temp["expires_at"] is not None
+    db.update_media("temp1", status="done", verdict="useful")
+
+    m_keep = db.create_media(
+        media_id="keep1",
+        original_filename="saved_video.mp4",
+        media_type="video",
+        file_path=str(kept_src),
+        file_size=kept_src.stat().st_size,
+    )
+    db.update_media("keep1", status="done", verdict="useful")
+
+    person = db.create_person("Marta")
+    db.insert_detection(
+        {
+            "id": "det1",
+            "media_id": "temp1",
+            "person_id": person["id"],
+            "portrait_score": 91.0,
+            "overall_score": 91.0,
+            "portrait_path": generated_portrait.name,
+            "status": "kept",
+        }
+    )
+
+    # User clicks "Mantener" on keep1 -> clears expires_at
+    ret_resp = client.patch("/api/media/keep1/retention", json={"keep_forever": True})
+    assert ret_resp.status_code == 200
+    assert ret_resp.json()["keep_forever"] == 1
+    assert ret_resp.json()["expires_at"] is None
+
+    # Simulate 65 minutes passing -> purge_expired_sources deletes temp_video.mp4 ONLY
+    future_iso = (datetime.now(timezone.utc) + timedelta(minutes=65)).isoformat()
+    purged = db.purge_expired_sources(now_iso=future_iso)
+    assert purged["purged_count"] == 1
+    assert purged["purged_ids"] == ["temp1"]
+    assert not ephemeral_src.exists()
+    assert kept_src.exists()  # Maintained file untouched!
+    assert generated_portrait.exists()  # Generated portrait preserved!
+    assert db.get_media("temp1")["source_deleted"] == 1
+    assert db.get_media("keep1")["source_deleted"] == 0
+
+    # 2. Verify optional Cloudflare PIN guard
+    monkeypatch.setattr(cfg, "ACCESS_PIN", "4821")
+    assert client.get("/api/auth/status").json() == {"pin_required": True}
+    assert client.get("/api/persons").status_code == 401
+    assert client.post("/api/auth/verify", json={"pin": "0000"}).status_code == 401
+    assert client.post("/api/auth/verify", json={"pin": "4821"}).status_code == 200
+    assert client.get("/api/persons", headers={"X-Access-Pin": "4821"}).status_code == 200
+

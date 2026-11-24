@@ -1,9 +1,11 @@
 import { useRef, useState } from 'react';
 import {
   CheckCircle2,
+  Clock,
   Film,
   Image as ImageIcon,
   Layers,
+  Pin,
   Sparkles,
   Upload,
   X,
@@ -16,6 +18,7 @@ interface Props {
   activeJob: JobInfo | null;
   lastFinishedJob: JobInfo | null;
   defaultSampleFps: number;
+  retentionMinutes: number;
   onJobStarted: (jobId: string) => void;
   onGoPeople: () => void;
   onToast: (msg: string) => void;
@@ -25,6 +28,7 @@ export function UploadStudio({
   activeJob,
   lastFinishedJob,
   defaultSampleFps,
+  retentionMinutes,
   onJobStarted,
   onGoPeople,
   onToast,
@@ -33,7 +37,16 @@ export function UploadStudio({
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
   const [sampleFps, setSampleFps] = useState<number>(defaultSampleFps || 1.0);
+  // Por defecto false: el archivo subido expira en 1 hora (lo generado se conserva siempre)
+  const [keepForever, setKeepForever] = useState<boolean>(false);
   const [uploading, setUploading] = useState(false);
+
+  const retentionLabel =
+    retentionMinutes === 60
+      ? '1 hora'
+      : retentionMinutes < 60
+        ? `${retentionMinutes} min`
+        : `${Math.round((retentionMinutes / 60) * 10) / 10} h`;
 
   const addFiles = (incoming: FileList | File[]) => {
     const arr = Array.from(incoming);
@@ -52,7 +65,7 @@ export function UploadStudio({
     if (files.length === 0) return;
     setUploading(true);
     try {
-      const res = await api.uploadMedia(files, sampleFps);
+      const res = await api.uploadMedia(files, sampleFps, keepForever);
       setFiles([]);
       onJobStarted(res.job_id);
       if (res.skipped.length > 0) {
@@ -60,7 +73,11 @@ export function UploadStudio({
           `Subidos ${res.uploaded_count} archivo(s). ${res.skipped.length} omitido(s) por formato.`
         );
       } else {
-        onToast(`Analizando ${res.uploaded_count} archivo(s) en segundo plano...`);
+        onToast(
+          keepForever
+            ? `Analizando ${res.uploaded_count} archivo(s) (originales conservados)...`
+            : `Analizando ${res.uploaded_count} archivo(s) (originales se borrarán en ${retentionLabel}; recortes conservados)...`
+        );
       }
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error al subir archivos');
@@ -78,9 +95,8 @@ export function UploadStudio({
         <div>
           <h1 className="page-title">Subir fotos y vídeos</h1>
           <p className="page-subtitle">
-            Arrastra una o varias fotos y vídeos. Se analizarán frame a frame en tu equipo para
-            detectar a cada persona, extraer los mejores retratos y recortes PNG sin otras personas,
-            y descartar automáticamente las tomas redundantes o de menor calidad.
+            Sube fotos o vídeos desde tu PC o móvil. Extraemos automáticamente los mejores retratos
+            y recortes PNG sin otras personas, descartando tomas borrosas o de menor calidad.
           </p>
         </div>
       </header>
@@ -115,15 +131,48 @@ export function UploadStudio({
           <div className="empty-studio-icon" style={{ marginBottom: 10 }}>
             <Upload size={25} />
           </div>
-          <div className="dropzone-title">Arrastra aquí tus fotos o vídeos</div>
-          <p style={{ margin: 0, color: 'var(--ink-secondary)', fontSize: '0.9rem' }}>
-            Soporta JPG, PNG, WebP, MP4, MOV, MKV, AVI, WebM · Todo se procesa 100% en local
+          <div className="dropzone-title">Toca o arrastra tus fotos y vídeos</div>
+          <p style={{ margin: 0, color: 'var(--ink-secondary)', fontSize: '0.89rem' }}>
+            JPG, PNG, WebP, MP4, MOV, MKV, WebM · Compatible con carrete de móvil
           </p>
+        </div>
+
+        {/* 1-hour auto-expiration policy toggle */}
+        <div className="retention-banner">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <div style={{ fontWeight: 700, fontSize: '0.88rem' }}>
+              Duración de los archivos subidos
+            </div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--ink-secondary)' }}>
+              {keepForever
+                ? 'Se conservarán los archivos originales para reproducir vídeos y buscar timestamps.'
+                : `Los originales se borran solos tras ${retentionLabel}. Los retratos, recortes PNG y perfiles generados NO se borran.`}
+            </div>
+          </div>
+
+          <div className="retention-segmented" role="group" aria-label="Retención de archivos">
+            <button
+              id="btn-retention-1h"
+              type="button"
+              className={`retention-opt ephemeral ${!keepForever ? 'active' : ''}`}
+              onClick={() => setKeepForever(false)}
+            >
+              <Clock size={14} /> Borrar en {retentionLabel}
+            </button>
+            <button
+              id="btn-retention-keep"
+              type="button"
+              className={`retention-opt keep ${keepForever ? 'active' : ''}`}
+              onClick={() => setKeepForever(true)}
+            >
+              <Pin size={14} /> Mantener originales
+            </button>
+          </div>
         </div>
 
         <div
           style={{
-            marginTop: 18,
+            marginTop: 16,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
@@ -131,9 +180,9 @@ export function UploadStudio({
             gap: 14,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-            <label htmlFor="select-fps" style={{ fontSize: '0.86rem', fontWeight: 600 }}>
-              Frecuencia en vídeos:
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <label htmlFor="select-fps" style={{ fontSize: '0.85rem', fontWeight: 600 }}>
+              Velocidad en vídeos:
             </label>
             <select
               id="select-fps"
@@ -142,17 +191,17 @@ export function UploadStudio({
               value={sampleFps}
               onChange={(e) => setSampleFps(Number(e.target.value))}
             >
-              <option value={0.5}>0.5 frames/seg (muy rápido, vídeos largos)</option>
-              <option value={1.0}>1 frame/seg (recomendado)</option>
-              <option value={2.0}>2 frames/seg (más preciso en movimiento)</option>
-              <option value={3.0}>3 frames/seg (máximo detalle)</option>
+              <option value={0.5}>0.5 fps (muy rápido)</option>
+              <option value={1.0}>1 fps (recomendado)</option>
+              <option value={2.0}>2 fps (más preciso)</option>
+              <option value={3.0}>3 fps (máximo detalle)</option>
             </select>
           </div>
 
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             {files.length > 0 && (
               <button className="btn btn-ghost btn-sm" onClick={() => setFiles([])}>
-                Limpiar cola
+                Limpiar
               </button>
             )}
             <button
@@ -251,8 +300,8 @@ export function UploadStudio({
               <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--ink-secondary)' }}>
                 {lastFinishedJob.summary.total_frames_analyzed} frames analizados ·{' '}
                 <strong>{lastFinishedJob.summary.kept_detections} mejores capturas</strong>{' '}
-                extraídas · {lastFinishedJob.summary.discarded_detections} descartadas por menor
-                calidad o redundancia · {lastFinishedJob.summary.new_persons} persona(s) nueva(s)
+                extraídas · {lastFinishedJob.summary.discarded_detections} descartadas ·{' '}
+                {lastFinishedJob.summary.new_persons} persona(s) nueva(s)
               </p>
             </div>
             <button id="btn-go-people-after-upload" className="btn btn-dark" onClick={onGoPeople}>

@@ -76,6 +76,8 @@ def detect_compute_device() -> dict[str, str]:
     }
 
 
+ACCESS_PIN = os.environ.get("FRIENDFINDER_PIN", "").strip()
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "video_sample_fps": "1.0",
     "similarity_threshold": "0.45",
@@ -83,6 +85,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "max_portraits_per_person": "6",
     "max_fullbody_per_person": "4",
     "min_video_gap_seconds": "1.5",
+    "source_retention_minutes": "60",
     "auto_scene_analysis": "false",
     "scene_backend": "heuristic",  # heuristic | blip | ollama
     "ollama_url": "http://localhost:11434",

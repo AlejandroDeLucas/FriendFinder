@@ -104,6 +104,8 @@ export interface MediaItem {
   kept_count: number;
   discarded_count: number;
   source_deleted: number;
+  keep_forever: number;
+  expires_at: string | null;
   status: string;
   verdict: 'useful' | 'discarded' | 'no_people' | 'pending';
   verdict_reason: string | null;
@@ -168,6 +170,7 @@ export interface AppSettings {
   max_portraits_per_person: string;
   max_fullbody_per_person: string;
   min_video_gap_seconds: string;
+  source_retention_minutes: string;
   auto_scene_analysis: string;
   scene_backend: 'heuristic' | 'blip' | 'ollama';
   ollama_url: string;

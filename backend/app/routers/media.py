@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from ..config import UPLOADS_DIR, ensure_data_dirs
 from ..database import db
+from ..schemas import MediaRetentionRequest
 from ..services.pipeline import classify_media_type, submit_media_batch
 
 router = APIRouter(prefix="/api/media", tags=["media"])
@@ -21,9 +22,14 @@ router = APIRouter(prefix="/api/media", tags=["media"])
 async def upload_media(
     files: list[UploadFile] = File(...),
     sample_fps: float | None = Form(default=None),
+    keep_forever: bool = Form(default=False),
     job_type: str = Form(default="ingest"),
 ) -> dict[str, Any]:
-    """Upload one or more photos and/or videos and start background frame-by-frame analysis."""
+    """Upload one or more photos and/or videos and start background frame-by-frame analysis.
+
+    By default, uploaded source files auto-expire after 1 hour (configurable) while all
+    generated person portraits, PNG cutouts, and profiles remain saved permanently.
+    """
     ensure_data_dirs()
     media_ids: list[str] = []
     skipped: list[dict[str, str]] = []
@@ -51,6 +57,7 @@ async def upload_media(
             media_type=media_type,
             file_path=str(dest_path),
             file_size=size,
+            keep_forever=keep_forever,
         )
         media_ids.append(media_id)
 
@@ -69,13 +76,35 @@ async def upload_media(
         "job_id": job_id,
         "media_ids": media_ids,
         "uploaded_count": len(media_ids),
+        "keep_forever": keep_forever,
         "skipped": skipped,
     }
 
 
+@router.post("/cleanup-expired")
+def cleanup_expired_media() -> dict[str, Any]:
+    """Immediately delete any expired uploaded source files while keeping generated person assets."""
+    return db.purge_expired_sources()
+
+
 @router.get("")
 def list_media(media_type: str | None = Query(default=None)) -> list[dict[str, Any]]:
+    # Opportunistically clean expired sources before listing
+    db.purge_expired_sources()
     return db.list_media(media_type=media_type)
+
+
+@router.patch("/{media_id}/retention")
+def update_media_retention(media_id: str, payload: MediaRetentionRequest) -> dict[str, Any]:
+    """Toggle whether an uploaded source photo/video is kept forever or auto-deleted after 1 hour."""
+    media = db.get_media(media_id)
+    if not media:
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    if media.get("source_deleted"):
+        raise HTTPException(status_code=410, detail="El archivo original ya fue borrado")
+    updated = db.set_media_retention(media_id, keep_forever=payload.keep_forever)
+    assert updated is not None
+    return updated
 
 
 @router.get("/{media_id}")
