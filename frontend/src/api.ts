@@ -13,30 +13,46 @@ const API_BASE_STORAGE_KEY = 'friendfinder_api_base';
 const PIN_STORAGE_KEY = 'friendfinder_access_pin';
 
 export function getApiBase(): string {
-  const saved = window.localStorage.getItem(API_BASE_STORAGE_KEY)?.trim();
-  if (saved) return saved.replace(/\/+$/, '');
+  try {
+    const saved = window.localStorage.getItem(API_BASE_STORAGE_KEY)?.trim();
+    if (saved) return saved.replace(/\/+$/, '');
+  } catch {
+    // ignore storage SecurityError in strict/private mobile webviews
+  }
   const envBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
   return envBase ? envBase.replace(/\/+$/, '') : '';
 }
 
 export function setApiBase(url: string): void {
   const cleaned = url.trim().replace(/\/+$/, '');
-  if (cleaned) {
-    window.localStorage.setItem(API_BASE_STORAGE_KEY, cleaned);
-  } else {
-    window.localStorage.removeItem(API_BASE_STORAGE_KEY);
+  try {
+    if (cleaned) {
+      window.localStorage.setItem(API_BASE_STORAGE_KEY, cleaned);
+    } else {
+      window.localStorage.removeItem(API_BASE_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
   }
 }
 
 export function getStoredPin(): string {
-  return window.sessionStorage.getItem(PIN_STORAGE_KEY) || '';
+  try {
+    return window.sessionStorage.getItem(PIN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
 }
 
 export function setStoredPin(pin: string): void {
-  if (pin.trim()) {
-    window.sessionStorage.setItem(PIN_STORAGE_KEY, pin.trim());
-  } else {
-    window.sessionStorage.removeItem(PIN_STORAGE_KEY);
+  try {
+    if (pin.trim()) {
+      window.sessionStorage.setItem(PIN_STORAGE_KEY, pin.trim());
+    } else {
+      window.sessionStorage.removeItem(PIN_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
   }
 }
 
@@ -58,17 +74,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (pin) headers.set('X-Access-Pin', pin);
 
   const res = await fetch(withBase(path), { ...init, headers });
+  const contentType = res.headers.get('content-type') || '';
+
   if (!res.ok) {
     let detail = `Error ${res.status}`;
-    try {
-      const data = await res.json();
-      if (data?.detail) {
-        detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+    if (contentType.includes('application/json')) {
+      try {
+        const data = await res.json();
+        if (data?.detail) {
+          detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+        }
+      } catch {
+        // ignore parse errors
       }
-    } catch {
-      // ignore non-json error body
     }
     throw new Error(detail);
+  }
+
+  if (!contentType.includes('application/json')) {
+    throw new Error('Backend no conectado (la respuesta no es JSON)');
   }
   return res.json() as Promise<T>;
 }

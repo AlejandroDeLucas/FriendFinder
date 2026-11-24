@@ -29,6 +29,7 @@ export function App() {
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [loading, setLoading] = useState(true);
+  const [backendOffline, setBackendOffline] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
   // Optional Cloudflare PIN access gate
@@ -65,16 +66,17 @@ export function App() {
         api.getStats(),
         api.getSettings(),
       ]);
-      setPersons(pList);
-      setMedia(mList);
+      setBackendOffline(false);
+      setPersons(Array.isArray(pList) ? pList : []);
+      setMedia(Array.isArray(mList) ? mList : []);
       setStats(sData);
       setSettings(setRes.settings);
-      if (!activeJobId && sData.active_jobs.length > 0) {
+      if (!activeJobId && Array.isArray(sData?.active_jobs) && sData.active_jobs.length > 0) {
         setActiveJobId(sData.active_jobs[0].id);
         setActiveJob(sData.active_jobs[0]);
       }
     } catch {
-      // Backend might still be starting up or require PIN
+      setBackendOffline(true);
     } finally {
       setLoading(false);
     }
@@ -330,6 +332,35 @@ export function App() {
       )}
 
       <main className="main-container">
+        {backendOffline && (
+          <div
+            className="panel"
+            style={{
+              marginBottom: 20,
+              padding: '14px 18px',
+              background: 'var(--warning-soft)',
+              borderColor: 'hsla(36, 76%, 42%, 0.25)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: 12,
+            }}
+          >
+            <div style={{ fontSize: '0.88rem', color: 'var(--ink-primary)' }}>
+              <strong>Backend de IA no conectado todavía.</strong> Si abriste esto en Cloudflare
+              Pages, arranca <code>./run-cloudflare.sh</code> en tu equipo y pega la URL HTTPS en
+              Ajustes.
+            </div>
+            <button
+              id="btn-connect-backend"
+              className="btn btn-dark btn-sm"
+              onClick={() => setShowSettings(true)}
+            >
+              Conectar servidor
+            </button>
+          </div>
+        )}
         {selectedPersonId ? (
           <PersonDetail
             personId={selectedPersonId}
