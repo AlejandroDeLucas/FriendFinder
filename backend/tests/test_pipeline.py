@@ -587,3 +587,91 @@ def test_merge_persons_preserves_photoless_centroid(isolated_env):
     assert person_b["id"] not in embs
     assert embs[person_a["id"]][10] > 0.5
     assert embs[person_a["id"]][11] > 0.5
+
+
+def test_recluster_unites_same_person_and_enforces_cannot_link(isolated_env):
+    """Verify recluster unites different-angle photos of the same person WITHOUT merging two faces in the same frame."""
+    db = isolated_env["db"]
+    client = isolated_env["client"]
+
+    # Two photos of the SAME person with realistic pose/lighting variance (cosine sim ~0.44)
+    emb_p1_front = np.zeros(512, dtype=np.float32)
+    emb_p1_front[0] = 1.0
+    emb_p1_angle = np.zeros(512, dtype=np.float32)
+    emb_p1_angle[0] = 0.44
+    emb_p1_angle[1] = float(np.sqrt(1.0 - 0.44 * 0.44))
+
+    # A lookalike friend standing NEXT to them in photo 1 (same frame -> Cannot-Link!)
+    emb_twin_same_frame = np.zeros(512, dtype=np.float32)
+    emb_twin_same_frame[0] = 0.60
+    emb_twin_same_frame[2] = float(np.sqrt(1.0 - 0.60 * 0.60))
+
+    m1 = db.create_media(
+        media_id="grp1",
+        original_filename="group1.jpg",
+        media_type="image",
+        file_path="/tmp/group1.jpg",
+        file_size=100,
+    )
+    m2 = db.create_media(
+        media_id="solo2",
+        original_filename="solo2.jpg",
+        media_type="image",
+        file_path="/tmp/solo2.jpg",
+        file_size=100,
+    )
+
+    # Start fragmented as 3 separate unnamed persons
+    pa = db.create_person("Persona 1", centroid=emb_p1_front)
+    pb = db.create_person("Persona 2", centroid=emb_p1_angle)
+    pc = db.create_person("Persona 3", centroid=emb_twin_same_frame)
+
+    db.insert_detection(
+        {
+            "media_id": m1["id"],
+            "person_id": pa["id"],
+            "frame_idx": 0,
+            "face_bbox": [50.0, 50.0, 150.0, 150.0],
+            "portrait_score": 82.0,
+            "frontality_score": 80.0,
+            "overall_score": 82.0,
+            "embedding": emb_p1_front,
+            "status": "kept",
+        }
+    )
+    db.insert_detection(
+        {
+            "media_id": m2["id"],
+            "person_id": pb["id"],
+            "frame_idx": 0,
+            "face_bbox": [60.0, 60.0, 160.0, 160.0],
+            "portrait_score": 40.0,  # moderate/candid angle (previously over-split!)
+            "frontality_score": 38.0,
+            "overall_score": 40.0,
+            "embedding": emb_p1_angle,
+            "status": "kept",
+        }
+    )
+    db.insert_detection(
+        {
+            "media_id": m1["id"],
+            "person_id": pc["id"],
+            "frame_idx": 0,
+            "face_bbox": [300.0, 50.0, 400.0, 150.0],  # same photo m1:0 -> Cannot-Link with pa!
+            "portrait_score": 78.0,
+            "frontality_score": 75.0,
+            "overall_score": 78.0,
+            "embedding": emb_twin_same_frame,
+            "status": "kept",
+        }
+    )
+
+    resp = client.post("/api/persons/recluster")
+    assert resp.status_code == 200
+    data = resp.json()
+    # pa + pb unite into 1 person, while pc stays separate due to Cannot-Link in m1:0!
+    assert data["persons_before"] == 3
+    assert data["persons_after"] == 2
+    counts = sorted(p["total_detections"] for p in client.get("/api/persons").json())
+    assert counts == [1, 2]
+

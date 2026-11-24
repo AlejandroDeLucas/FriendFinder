@@ -117,50 +117,74 @@ async function matchOrCreateBrowserPerson(
   faceDetScore: number,
   metrics: BrowserQualityMetrics,
   threshold: number,
-  centroids: Map<string, PersonMatchEntry>
+  centroids: Map<string, PersonMatchEntry>,
+  excludePersonIds: Set<string> = new Set()
 ): Promise<{ personId: string; personName: string; isNew: boolean }> {
-  // Strict dlib 128-D Euclidean threshold (0.47 at default threshold=0.45):
-  // prevents merging different people while reliably matching the same person across clear frames.
-  const baseMaxDist = Math.max(0.36, Math.min(0.56, 0.47 - (threshold - 0.45) * 0.45));
-  const isCleanFrontal =
-    faceDetScore >= 0.62 && metrics.portrait_score >= 52 && metrics.frontality_score >= 48;
-  // Require an even tighter match for blurry or extreme-profile faces so they never pollute a cluster
-  const effectiveMaxDist = isCleanFrontal ? baseMaxDist : Math.max(0.34, baseMaxDist - 0.05);
+  // Calibrated dlib 128-D Euclidean threshold (0.54 at default threshold=0.45):
+  // Empirically, same-person different-photo distances span 0.35–0.54 while different people sit >= 0.60.
+  // Combined with per-frame Cannot-Link exclusion + runner-up margin guard, this unites real matches
+  // across smiles/angles/lighting without merging different friends in group photos.
+  const baseMaxDist = Math.max(0.42, Math.min(0.62, 0.54 - (threshold - 0.45) * 0.45));
+  const isVeryLowQuality =
+    faceDetScore < 0.45 || metrics.portrait_score < 32 || metrics.frontality_score < 30;
+  const isCleanAnchor =
+    faceDetScore >= 0.55 && metrics.portrait_score >= 44 && metrics.frontality_score >= 40;
+  const effectiveMaxDist = isVeryLowQuality ? Math.max(0.40, baseMaxDist - 0.025) : baseMaxDist;
 
   let bestId: string | null = null;
   let bestName = '';
-  let bestScoreDist = Infinity;
+  let bestCombined = Infinity;
+  let bestExMin = Infinity;
+  let secondBestCombined = Infinity;
 
   for (const [pid, info] of centroids.entries()) {
+    // Cannot-Link: two faces appearing in the SAME photo/frame cannot be the same person
+    if (excludePersonIds.has(pid)) continue;
+
     const centroidDist = euclideanDistance(embedding, info.vec);
-    // Avoid single-linkage chaining: require BOTH centroid AND average of top-3 closest exemplars to agree
     const exDists = info.exemplars
       .map((ex) => euclideanDistance(embedding, ex))
       .sort((a, b) => a - b);
+    const bestEx = exDists.length > 0 ? exDists[0] : centroidDist;
     const topK = exDists.slice(0, Math.min(3, exDists.length));
     const avgTopDist =
       topK.length > 0 ? topK.reduce((s, d) => s + d, 0) / topK.length : centroidDist;
-    const combinedDist = 0.55 * centroidDist + 0.45 * avgTopDist;
+    const combinedDist = 0.45 * centroidDist + 0.35 * avgTopDist + 0.20 * bestEx;
 
-    if (
-      centroidDist <= effectiveMaxDist + 0.03 &&
-      avgTopDist <= effectiveMaxDist &&
-      combinedDist < bestScoreDist
-    ) {
-      bestScoreDist = combinedDist;
-      bestId = pid;
-      bestName = info.name;
+    const directMatch =
+      centroidDist <= effectiveMaxDist + 0.03 && avgTopDist <= effectiveMaxDist + 0.02;
+    const strongExemplarMatch =
+      bestEx <= effectiveMaxDist - 0.05 && centroidDist <= effectiveMaxDist + 0.06;
+
+    if (directMatch || strongExemplarMatch) {
+      if (combinedDist < bestCombined) {
+        secondBestCombined = bestCombined;
+        bestCombined = combinedDist;
+        bestExMin = bestEx;
+        bestId = pid;
+        bestName = info.name;
+      } else if (combinedDist < secondBestCombined) {
+        secondBestCombined = combinedDist;
+      }
     }
   }
 
-  if (bestId && bestScoreDist <= effectiveMaxDist) {
-    // Only clean, well-framed faces may update the running centroid/exemplars (prevents cluster drift!)
-    if (isCleanFrontal) {
+  // Ambiguity guard in the borderline zone: if two different people are nearly tied, require a clear exemplar match
+  const isBorderline = bestCombined > effectiveMaxDist - 0.03;
+  const isAmbiguousTie =
+    isBorderline &&
+    secondBestCombined < Infinity &&
+    secondBestCombined - bestCombined < 0.03 &&
+    bestExMin > effectiveMaxDist - 0.04;
+
+  if (bestId && bestCombined <= effectiveMaxDist + 0.015 && !isAmbiguousTie) {
+    // Update running centroid & diverse exemplars for clean shots so future angles match even better
+    if (isCleanAnchor) {
       const cur = centroids.get(bestId)!;
       const nextCount = cur.count + 1;
       const nextVec = cur.vec.map((v, i) => (v * cur.count + embedding[i]) / nextCount);
       const nextExemplars =
-        cur.exemplars.length < 8 ? [...cur.exemplars, [...embedding]] : cur.exemplars;
+        cur.exemplars.length < 10 ? [...cur.exemplars, [...embedding]] : cur.exemplars;
       centroids.set(bestId, {
         name: cur.name,
         vec: nextVec,
@@ -343,6 +367,7 @@ async function processFrameCanvas(
   );
 
   const threshold = Number(settings.similarity_threshold || '0.45');
+  const frameAssignedPersons = new Set<string>();
   let keptCount = 0;
   let discardedCount = 0;
   let newPersons = 0;
@@ -363,8 +388,10 @@ async function processFrameCanvas(
       face.detScore,
       metrics,
       threshold,
-      centroids
+      centroids,
+      frameAssignedPersons
     );
+    frameAssignedPersons.add(personId);
     affectedPersons.add(personId);
     if (isNew) newPersons++;
     const prevTrack = batchPersonTracker.get(personId);
@@ -1421,10 +1448,11 @@ export async function reassignBrowserDetection(
 }
 
 /**
- * Global complete-linkage quality-first re-clustering across all stored detections.
- * - Preserves all user-named friends (anchored on their cover/best frontal detection).
- * - Processes sharpest frontal faces first so blurry/profile frames can never cause cluster drift.
- * - Uses complete-linkage anchor checks so two different people can never be chained together.
+ * Global quality-first re-clustering across all stored detections with:
+ * - Calibrated dlib 128-D distance threshold (0.54 at default) to unite the same person across angles/lighting.
+ * - Per-frame Cannot-Link constraints (two faces in the SAME photo/frame can never merge into one person).
+ * - Multi-anchor preservation of user-named friends & manual merges.
+ * - Hierarchical cluster-to-cluster post-merge pass that reunites fragmented clusters via denoised centroids.
  */
 export async function reclusterAllBrowserPersons(): Promise<{
   persons_before: number;
@@ -1442,8 +1470,20 @@ export async function reclusterAllBrowserPersons(): Promise<{
   }
 
   const threshold = Number(settings.similarity_threshold || '0.45');
-  const maxDist = Math.max(0.35, Math.min(0.54, 0.46 - (threshold - 0.45) * 0.45));
+  const maxDist = Math.max(0.42, Math.min(0.62, 0.54 - (threshold - 0.45) * 0.45));
   const detById = new Map(allDets.map((d) => [d.id, d]));
+
+  const frameKeyOf = (d: StoredDetection): string | null =>
+    d.face_bbox ? `${d.media_id}:${d.frame_idx}` : null;
+
+  const computeMeanVec = (vecs: number[][]): number[] => {
+    const dim = vecs[0].length;
+    const mean = new Array<number>(dim).fill(0);
+    for (const v of vecs) {
+      for (let i = 0; i < dim; i++) mean[i] += v[i];
+    }
+    return mean.map((val) => val / vecs.length);
+  };
 
   interface Cluster {
     id: string;
@@ -1453,35 +1493,67 @@ export async function reclusterAllBrowserPersons(): Promise<{
     centroid: number[];
     anchors: number[][];
     detIds: string[];
+    frameKeys: Set<string>;
   }
 
   const clusters: Cluster[] = [];
   const assignedDetIds = new Set<string>();
 
-  // 1. Seed user-named persons (and any saved photo-less identity with a centroid) so they are ALWAYS preserved
+  // 1. Seed user-named persons (and saved photo-less identities) with up to 8 compatible detections
+  //    so user manual merges & multi-angle named profiles stay intact!
   const isCustomName = (n: string) => !/^Persona \d+$/i.test(n.trim());
   for (const p of existingPersons) {
-    const mine = allDets.filter((d) => d.person_id === p.id && Array.isArray(d.embedding));
+    const mine = allDets
+      .filter((d) => d.person_id === p.id && Array.isArray(d.embedding) && d.embedding.length > 0)
+      .sort(
+        (a, b) =>
+          b.portrait_score + 0.35 * b.frontality_score - (a.portrait_score + 0.35 * a.frontality_score)
+      );
     const isPhotoLessSaved = mine.length === 0 && Array.isArray(p.centroid) && p.centroid.length > 0;
     if (!isCustomName(p.name) && !isPhotoLessSaved) continue;
 
     const coverDet = p.cover_detection_id ? detById.get(p.cover_detection_id) : undefined;
     const bestDet =
-      coverDet && Array.isArray(coverDet.embedding)
+      coverDet && Array.isArray(coverDet.embedding) && coverDet.embedding.length > 0
         ? coverDet
-        : mine.sort((a, b) => b.portrait_score - a.portrait_score)[0];
+        : mine[0];
 
     if (bestDet && bestDet.embedding) {
+      const fKeys = new Set<string>();
+      const bestFk = frameKeyOf(bestDet);
+      if (bestFk) fKeys.add(bestFk);
+
+      const anchors: number[][] = [[...bestDet.embedding]];
+      const detIds: string[] = [bestDet.id];
+      assignedDetIds.add(bestDet.id);
+
+      // Keep other compatible detections already belonging to this named person (preserves manual merges
+      // while still allowing obvious unrelated false-merges > maxDist + 0.08 to split cleanly)
+      for (const extra of mine) {
+        if (extra.id === bestDet.id || !extra.embedding) continue;
+        const fk = frameKeyOf(extra);
+        if (fk && fKeys.has(fk)) continue;
+        const distToCover = euclideanDistance(extra.embedding, bestDet.embedding);
+        if (distToCover <= maxDist + 0.08) {
+          detIds.push(extra.id);
+          assignedDetIds.add(extra.id);
+          if (fk) fKeys.add(fk);
+          if (anchors.length < 8) {
+            anchors.push([...extra.embedding]);
+          }
+        }
+      }
+
       clusters.push({
         id: p.id,
         name: p.name,
         notes: p.notes || '',
         isNamed: true,
-        centroid: [...bestDet.embedding],
-        anchors: [[...bestDet.embedding]],
-        detIds: [bestDet.id],
+        centroid: computeMeanVec(anchors),
+        anchors,
+        detIds,
+        frameKeys: fKeys,
       });
-      assignedDetIds.add(bestDet.id);
     } else if (Array.isArray(p.centroid) && p.centroid.length > 0) {
       const savedRefs =
         Array.isArray(p.reference_embeddings) && p.reference_embeddings.length > 0
@@ -1495,11 +1567,12 @@ export async function reclusterAllBrowserPersons(): Promise<{
         centroid: [...p.centroid],
         anchors: savedRefs,
         detIds: [],
+        frameKeys: new Set<string>(),
       });
     }
   }
 
-  // 2. Sort remaining detections by quality + frontality DESC so crisp frontal faces build pure clusters first
+  // 2. Sort remaining detections by quality + frontality DESC so crisp shots build pure clusters first
   const remaining = allDets
     .filter((d) => !assignedDetIds.has(d.id) && Array.isArray(d.embedding) && d.embedding.length > 0)
     .sort(
@@ -1516,46 +1589,63 @@ export async function reclusterAllBrowserPersons(): Promise<{
 
   for (const det of remaining) {
     const emb = det.embedding!;
-    const isCleanFrontal =
-      det.det_score >= 0.55 && det.portrait_score >= 48 && det.frontality_score >= 45;
-    const localMaxDist = isCleanFrontal ? maxDist : Math.max(0.34, maxDist - 0.05);
+    const fk = frameKeyOf(det);
+    const isVeryLowQuality =
+      det.det_score < 0.45 || det.portrait_score < 32 || det.frontality_score < 30;
+    const isCleanAnchor =
+      det.det_score >= 0.52 && det.portrait_score >= 42 && det.frontality_score >= 38;
+    const localMaxDist = isVeryLowQuality ? Math.max(0.40, maxDist - 0.025) : maxDist;
 
     let bestCluster: Cluster | null = null;
     let bestCombined = Infinity;
+    let bestExMin = Infinity;
+    let secondBestCombined = Infinity;
 
     for (const c of clusters) {
-      const cDist = euclideanDistance(emb, c.centroid);
-      const anchorDists = c.anchors.map((a) => euclideanDistance(emb, a));
-      const maxAnchorDist = Math.max(...anchorDists);
-      const avgAnchorDist = anchorDists.reduce((s, v) => s + v, 0) / anchorDists.length;
+      // Cannot-Link: never place two detections from the same photo/video frame into the same person
+      if (fk && c.frameKeys.has(fk)) continue;
 
-      // Complete-linkage check: must agree with centroid AND not contradict existing anchors
-      if (
-        cDist <= localMaxDist + 0.02 &&
-        avgAnchorDist <= localMaxDist &&
-        maxAnchorDist <= localMaxDist + 0.08
-      ) {
-        const score = 0.55 * cDist + 0.45 * avgAnchorDist;
-        if (score < bestCombined) {
-          bestCombined = score;
+      const cDist = euclideanDistance(emb, c.centroid);
+      const anchorDists = c.anchors.map((a) => euclideanDistance(emb, a)).sort((a, b) => a - b);
+      const bestEx = anchorDists[0];
+      const topK = anchorDists.slice(0, Math.min(3, anchorDists.length));
+      const avgTopDist = topK.reduce((s, v) => s + v, 0) / topK.length;
+      const combined = 0.45 * cDist + 0.35 * avgTopDist + 0.20 * bestEx;
+
+      const directMatch =
+        cDist <= localMaxDist + 0.03 && avgTopDist <= localMaxDist + 0.02;
+      const strongExemplarMatch =
+        bestEx <= localMaxDist - 0.05 && cDist <= localMaxDist + 0.06;
+
+      if (directMatch || strongExemplarMatch) {
+        if (combined < bestCombined) {
+          secondBestCombined = bestCombined;
+          bestCombined = combined;
+          bestExMin = bestEx;
           bestCluster = c;
+        } else if (combined < secondBestCombined) {
+          secondBestCombined = combined;
         }
       }
     }
 
-    if (bestCluster) {
+    const isBorderline = bestCombined > localMaxDist - 0.03;
+    const isAmbiguousTie =
+      isBorderline &&
+      secondBestCombined < Infinity &&
+      secondBestCombined - bestCombined < 0.03 &&
+      bestExMin > localMaxDist - 0.04;
+
+    if (bestCluster && bestCombined <= localMaxDist + 0.015 && !isAmbiguousTie) {
       bestCluster.detIds.push(det.id);
-      if (isCleanFrontal && bestCluster.anchors.length < 6) {
+      if (fk) bestCluster.frameKeys.add(fk);
+      if (isCleanAnchor && bestCluster.anchors.length < 10) {
         bestCluster.anchors.push([...emb]);
-        // Recompute pure centroid from anchors only
-        const dim = emb.length;
-        const mean = new Array<number>(dim).fill(0);
-        for (const a of bestCluster.anchors) {
-          for (let i = 0; i < dim; i++) mean[i] += a[i];
-        }
-        bestCluster.centroid = mean.map((v) => v / bestCluster.anchors.length);
+        bestCluster.centroid = computeMeanVec(bestCluster.anchors);
       }
     } else {
+      const fKeys = new Set<string>();
+      if (fk) fKeys.add(fk);
       clusters.push({
         id: uid(),
         name: nextAutoName(),
@@ -1564,15 +1654,88 @@ export async function reclusterAllBrowserPersons(): Promise<{
         centroid: [...emb],
         anchors: [[...emb]],
         detIds: [det.id],
+        frameKeys: fKeys,
       });
     }
   }
 
-  // 3. Persist new clusters cleanly & remove obsolete person rows
+  // 3. Post-clustering hierarchical cluster-to-cluster merge pass:
+  //    Denoised cluster centroids often reveal that two fragmented clusters are the exact same person!
+  const setsOverlap = (a: Set<string>, b: Set<string>): boolean => {
+    const [small, big] = a.size <= b.size ? [a, b] : [b, a];
+    for (const item of small) {
+      if (big.has(item)) return true;
+    }
+    return false;
+  };
+
+  let mergedAny = true;
+  while (mergedAny) {
+    mergedAny = false;
+    let bestPair: [number, number] | null = null;
+    let bestPairDist = Infinity;
+
+    for (let i = 0; i < clusters.length; i++) {
+      for (let j = i + 1; j < clusters.length; j++) {
+        const a = clusters[i];
+        const b = clusters[j];
+        // Never auto-merge two separately user-named friends
+        if (a.isNamed && b.isNamed) continue;
+        // Cannot-Link: never merge two clusters that appeared together in the same photo/frame
+        if (setsOverlap(a.frameKeys, b.frameKeys)) continue;
+
+        const cDist = euclideanDistance(a.centroid, b.centroid);
+        if (cDist > maxDist + 0.01) continue;
+
+        let minLink = Infinity;
+        let sumLink = 0;
+        let pairCount = 0;
+        for (const ea of a.anchors) {
+          for (const eb of b.anchors) {
+            const d = euclideanDistance(ea, eb);
+            if (d < minLink) minLink = d;
+            sumLink += d;
+            pairCount++;
+          }
+        }
+        const avgLink = pairCount > 0 ? sumLink / pairCount : cDist;
+
+        if (
+          cDist <= maxDist &&
+          (avgLink <= maxDist + 0.04 || minLink <= maxDist - 0.05) &&
+          cDist < bestPairDist
+        ) {
+          bestPairDist = cDist;
+          bestPair = [i, j];
+        }
+      }
+    }
+
+    if (bestPair) {
+      const [i, j] = bestPair;
+      // Keep named cluster (or larger cluster) as the survivor
+      const [keepIdx, dropIdx] =
+        clusters[j].isNamed || (!clusters[i].isNamed && clusters[j].detIds.length > clusters[i].detIds.length)
+          ? [j, i]
+          : [i, j];
+      const keep = clusters[keepIdx];
+      const drop = clusters[dropIdx];
+
+      keep.detIds.push(...drop.detIds);
+      for (const fk of drop.frameKeys) keep.frameKeys.add(fk);
+      for (const anc of drop.anchors) {
+        if (keep.anchors.length < 10) keep.anchors.push(anc);
+      }
+      keep.centroid = computeMeanVec(keep.anchors);
+      clusters.splice(dropIdx, 1);
+      mergedAny = true;
+    }
+  }
+
+  // 4. Persist new clusters cleanly & remove obsolete person rows
   const keptPersonIds = new Set(clusters.map((c) => c.id));
   for (const oldP of existingPersons) {
     if (!keptPersonIds.has(oldP.id)) {
-      // Remove empty/obsolete person record directly via deleteBrowserPerson only after reassigning
       await savePerson({ ...oldP, is_ignored: 1 });
     }
   }
@@ -1587,6 +1750,7 @@ export async function reclusterAllBrowserPersons(): Promise<{
       name: c.name,
       notes: c.notes,
       centroid: c.centroid,
+      reference_embeddings: c.anchors.slice(0, 8),
       cover_detection_id: existing?.cover_detection_id || c.detIds[0] || null,
       best_portrait_id: c.detIds[0] || null,
       best_body_id: null,

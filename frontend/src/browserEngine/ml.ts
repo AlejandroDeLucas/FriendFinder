@@ -342,13 +342,40 @@ function mapAndValidateFaceItem(
   };
 }
 
-function mergeFaceCandidates(existing: BrowserFace[], incoming: BrowserFace | null): void {
+function isSameFaceBox(
+  a: [number, number, number, number],
+  b: [number, number, number, number]
+): boolean {
+  if (boxIoU(a, b) > 0.30) return true;
+  const acx = 0.5 * (a[0] + a[2]);
+  const acy = 0.5 * (a[1] + a[3]);
+  const bcx = 0.5 * (b[0] + b[2]);
+  const bcy = 0.5 * (b[1] + b[3]);
+  const aCenterInB = acx >= b[0] && acx <= b[2] && acy >= b[1] && acy <= b[3];
+  const bCenterInA = bcx >= a[0] && bcx <= a[2] && bcy >= a[1] && bcy <= a[3];
+  if (aCenterInB && bCenterInA) {
+    const areaA = Math.max(1, (a[2] - a[0]) * (a[3] - a[1]));
+    const areaB = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]));
+    const ratio = areaA / areaB;
+    return ratio >= 0.35 && ratio <= 2.85;
+  }
+  return false;
+}
+
+function mergeFaceCandidates(
+  existing: BrowserFace[],
+  incoming: BrowserFace | null,
+  preferHigherRes = false
+): void {
   if (!incoming) return;
-  const dupIdx = existing.findIndex((m) => boxIoU(m.bbox, incoming.bbox) > 0.36);
+  const dupIdx = existing.findIndex((m) => isSameFaceBox(m.bbox, incoming.bbox));
   if (dupIdx === -1) {
     existing.push(incoming);
-  } else if (incoming.detScore > existing[dupIdx].detScore + 0.05) {
-    // Keep the higher-confidence detection & embedding (e.g. from zoomed tile)
+  } else if (
+    incoming.detScore > existing[dupIdx].detScore + 0.05 ||
+    (preferHigherRes && incoming.detScore >= existing[dupIdx].detScore - 0.04)
+  ) {
+    // Keep the higher-confidence or higher-resolution zoomed-tile embedding for tighter clustering
     existing[dupIdx] = incoming;
   }
 }
@@ -408,7 +435,7 @@ export async function detectFacesOnlyBrowser(
         .withFaceExpressions()
         .withFaceDescriptors();
       for (const item of tileRaw) {
-        mergeFaceCandidates(merged, mapAndValidateFaceItem(item, w, h, ox, 0));
+        mergeFaceCandidates(merged, mapAndValidateFaceItem(item, w, h, ox, 0), true);
       }
     }
   }

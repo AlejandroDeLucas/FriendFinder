@@ -75,24 +75,32 @@ def match_or_create_person(
     embedding: np.ndarray,
     threshold: float,
     in_memory_centroids: dict[str, tuple[str, np.ndarray, int]],
+    exclude_person_ids: set[str] | None = None,
 ) -> tuple[str, str, bool]:
     """Match a face embedding against existing persons or create a new person cluster.
 
     Returns (person_id, person_name, is_new).
     """
+    excluded = exclude_person_ids or set()
+    # ArcFace 512-D cosine similarity: same person across different angles/lighting often sits at 0.38–0.55,
+    # while different people sit < 0.30. Combined with Cannot-Link per frame, threshold-0.04 avoids over-splitting.
+    eff_threshold = max(0.32, min(0.75, threshold - 0.04))
+
     with _cluster_lock:
         best_pid: str | None = None
         best_name: str = ""
         best_sim = -1.0
 
         for pid, (name, centroid, _count) in in_memory_centroids.items():
+            if pid in excluded:
+                continue
             sim = cosine_similarity(embedding, centroid)
             if sim > best_sim:
                 best_sim = sim
                 best_pid = pid
                 best_name = name
 
-        if best_pid is not None and best_sim >= threshold:
+        if best_pid is not None and best_sim >= eff_threshold:
             # Update running centroid smoothly
             name, old_c, count = in_memory_centroids[best_pid]
             new_c = old_c * count + embedding
@@ -262,6 +270,7 @@ def _process_single_frame(
         return 0, 0, 0
 
     used_body_indices: set[int] = set()
+    frame_assigned_persons: set[str] = set()
     kept_in_frame = 0
     discarded_in_frame = 0
     shared_frame_name: str | None = None
@@ -281,8 +290,13 @@ def _process_single_frame(
             used_body_indices.add(metrics.matched_body_idx)
 
         person_id, person_name, is_new = match_or_create_person(
-            database, face.embedding, threshold, in_memory_centroids
+            database,
+            face.embedding,
+            threshold,
+            in_memory_centroids,
+            exclude_person_ids=frame_assigned_persons,
         )
+        frame_assigned_persons.add(person_id)
         affected_persons.add(person_id)
         if is_new:
             stats["new_persons"] += 1
@@ -796,12 +810,16 @@ def classify_media_type(filename: str) -> str | None:
 
 
 def recluster_all_persons(database: Database | None = None) -> dict[str, int]:
-    """Global quality-first complete-linkage 512-D ArcFace re-clustering preserving user-named friends."""
+    """Global quality-first 512-D ArcFace re-clustering with Cannot-Link constraints & hierarchical post-merge."""
     import re
 
     db = database or default_db
     settings = db.get_settings()
     base_thresh = float(settings.get("similarity_threshold", "0.45"))
+    # Calibrated ArcFace cosine threshold (0.41 at default 0.45): unites real matches across angles/lighting
+    # while Cannot-Link per frame + runner-up margin prevent merging different people.
+    clean_sim_thresh = max(0.32, min(0.72, base_thresh - 0.04))
+    lowq_sim_thresh = max(0.35, min(0.75, base_thresh - 0.01))
 
     existing_persons = db.list_persons(include_ignored=False)
     all_dets = db.get_all_detections_with_embeddings()
@@ -816,40 +834,81 @@ def recluster_all_persons(database: Database | None = None) -> dict[str, int]:
     def is_custom_name(name: str) -> bool:
         return not re.match(r"^Persona \d+$", name.strip(), re.IGNORECASE)
 
+    def frame_key_of(d: dict[str, Any]) -> str | None:
+        if d.get("face_bbox"):
+            return f"{d['media_id']}:{d.get('frame_idx', 0)}"
+        return None
+
+    def compute_norm_mean(vecs: list[np.ndarray]) -> np.ndarray:
+        mean_vec = np.mean(vecs, axis=0)
+        norm = float(np.linalg.norm(mean_vec))
+        return mean_vec / norm if norm > 0 else mean_vec
+
     # 1. Anchor every user-named person (and any photo-less saved identity with a centroid)
     centroid_by_pid = {pid: emb for pid, _n, emb in db.get_all_person_embeddings()}
     for p in existing_persons:
-        mine = [d for d in all_dets if d.get("person_id") == p["id"] and d.get("embedding_vec") is not None]
+        mine = sorted(
+            [d for d in all_dets if d.get("person_id") == p["id"] and d.get("embedding_vec") is not None],
+            key=lambda d: float(d["portrait_score"]) + 0.35 * float(d["frontality_score"]),
+            reverse=True,
+        )
         is_photoless_saved = len(mine) == 0 and p["id"] in centroid_by_pid
         if not is_custom_name(p["name"]) and not is_photoless_saved:
             continue
         cover_id = p.get("cover_detection_id")
         anchor_det = det_by_id.get(cover_id) if cover_id else None
         if anchor_det is None or anchor_det.get("embedding_vec") is None:
-            anchor_det = max(mine, key=lambda d: float(d["portrait_score"])) if mine else None
+            anchor_det = mine[0] if mine else None
 
         if anchor_det is not None and anchor_det.get("embedding_vec") is not None:
             emb = anchor_det["embedding_vec"]
+            fkeys: set[str] = set()
+            fk0 = frame_key_of(anchor_det)
+            if fk0:
+                fkeys.add(fk0)
+            anchors = [emb.copy()]
+            det_ids = [anchor_det["id"]]
+            assigned.add(anchor_det["id"])
+
+            # Preserve compatible detections already assigned to this named person (keeps manual merges intact
+            # while still letting clearly unrelated faces split out cleanly)
+            for extra in mine:
+                if extra["id"] == anchor_det["id"]:
+                    continue
+                efk = frame_key_of(extra)
+                if efk and efk in fkeys:
+                    continue
+                if cosine_similarity(extra["embedding_vec"], emb) >= max(0.28, clean_sim_thresh - 0.06):
+                    det_ids.append(extra["id"])
+                    assigned.add(extra["id"])
+                    if efk:
+                        fkeys.add(efk)
+                    if len(anchors) < 8:
+                        anchors.append(extra["embedding_vec"].copy())
+
             clusters.append(
                 {
                     "id": p["id"],
                     "name": p["name"],
-                    "centroid": emb.copy(),
-                    "anchors": [emb.copy()],
-                    "det_ids": [anchor_det["id"]],
+                    "is_named": True,
+                    "centroid": compute_norm_mean(anchors),
+                    "anchors": anchors,
+                    "det_ids": det_ids,
+                    "frame_keys": fkeys,
                     "existing": True,
                 }
             )
-            assigned.add(anchor_det["id"])
         elif p["id"] in centroid_by_pid:
             emb = centroid_by_pid[p["id"]]
             clusters.append(
                 {
                     "id": p["id"],
                     "name": p["name"],
+                    "is_named": True,
                     "centroid": emb.copy(),
                     "anchors": [emb.copy()],
                     "det_ids": [],
+                    "frame_keys": set(),
                     "existing": True,
                 }
             )
@@ -874,46 +933,132 @@ def recluster_all_persons(database: Database | None = None) -> dict[str, int]:
 
     for d in remaining:
         emb = d["embedding_vec"]
-        is_clean = float(d["portrait_score"]) >= 50.0 and float(d["frontality_score"]) >= 48.0
-        req_sim = base_thresh if is_clean else min(0.8, base_thresh + 0.05)
+        fk = frame_key_of(d)
+        is_low_q = float(d["portrait_score"]) < 32.0 or float(d["frontality_score"]) < 30.0
+        is_clean_anchor = float(d["portrait_score"]) >= 42.0 and float(d["frontality_score"]) >= 38.0
+        req_sim = lowq_sim_thresh if is_low_q else clean_sim_thresh
 
         best_c = None
         best_score = -1.0
-        for c in clusters:
-            c_sim = cosine_similarity(emb, c["centroid"])
-            a_sims = [cosine_similarity(emb, a) for a in c["anchors"]]
-            min_a_sim = min(a_sims)
-            avg_a_sim = sum(a_sims) / len(a_sims)
-            # Complete-linkage check: agrees with centroid AND does not contradict top anchors
-            if c_sim >= req_sim and avg_a_sim >= req_sim and min_a_sim >= req_sim - 0.08:
-                score = 0.55 * c_sim + 0.45 * avg_a_sim
-                if score > best_score:
-                    best_score = score
-                    best_c = c
+        best_ex_max = -1.0
+        second_best_score = -1.0
 
-        if best_c is not None:
+        for c in clusters:
+            # Cannot-Link: two faces in the same photo/frame cannot belong to the same person
+            if fk and fk in c["frame_keys"]:
+                continue
+
+            c_sim = cosine_similarity(emb, c["centroid"])
+            a_sims = sorted((cosine_similarity(emb, a) for a in c["anchors"]), reverse=True)
+            best_ex = a_sims[0]
+            top_k = a_sims[: min(3, len(a_sims))]
+            avg_top_sim = sum(top_k) / len(top_k)
+            score = 0.45 * c_sim + 0.35 * avg_top_sim + 0.20 * best_ex
+
+            direct_match = c_sim >= req_sim - 0.03 and avg_top_sim >= req_sim - 0.02
+            strong_ex_match = best_ex >= req_sim + 0.05 and c_sim >= req_sim - 0.06
+
+            if direct_match or strong_ex_match:
+                if score > best_score:
+                    second_best_score = best_score
+                    best_score = score
+                    best_ex_max = best_ex
+                    best_c = c
+                elif score > second_best_score:
+                    second_best_score = score
+
+        is_borderline = best_score < req_sim + 0.03
+        is_ambiguous = (
+            is_borderline
+            and second_best_score > 0
+            and (best_score - second_best_score) < 0.03
+            and best_ex_max < req_sim + 0.04
+        )
+
+        if best_c is not None and best_score >= req_sim - 0.015 and not is_ambiguous:
             best_c["det_ids"].append(d["id"])
-            if is_clean and len(best_c["anchors"]) < 6:
+            if fk:
+                best_c["frame_keys"].add(fk)
+            if is_clean_anchor and len(best_c["anchors"]) < 10:
                 best_c["anchors"].append(emb.copy())
-                mean_vec = np.mean(best_c["anchors"], axis=0)
-                norm = float(np.linalg.norm(mean_vec))
-                best_c["centroid"] = mean_vec / norm if norm > 0 else mean_vec
+                best_c["centroid"] = compute_norm_mean(best_c["anchors"])
         else:
-            created = db.create_person(name=next_name(), centroid=emb)
+            fkeys_new: set[str] = set()
+            if fk:
+                fkeys_new.add(fk)
             clusters.append(
                 {
-                    "id": created["id"],
-                    "name": created["name"],
+                    "id": None,
+                    "name": next_name(),
+                    "is_named": False,
                     "centroid": emb.copy(),
                     "anchors": [emb.copy()],
                     "det_ids": [d["id"]],
+                    "frame_keys": fkeys_new,
                     "existing": False,
                 }
             )
 
+    # 3. Post-clustering hierarchical cluster-to-cluster merge pass (reunites fragments via denoised centroids)
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        best_pair: tuple[int, int] | None = None
+        best_pair_sim = -1.0
+
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                a = clusters[i]
+                b = clusters[j]
+                if a["is_named"] and b["is_named"]:
+                    continue
+                if a["frame_keys"] and b["frame_keys"] and not a["frame_keys"].isdisjoint(b["frame_keys"]):
+                    continue
+
+                c_sim = cosine_similarity(a["centroid"], b["centroid"])
+                if c_sim < clean_sim_thresh - 0.01:
+                    continue
+
+                pair_sims = [
+                    cosine_similarity(ea, eb) for ea in a["anchors"] for eb in b["anchors"]
+                ]
+                max_link = max(pair_sims) if pair_sims else c_sim
+                avg_link = sum(pair_sims) / len(pair_sims) if pair_sims else c_sim
+
+                if (
+                    c_sim >= clean_sim_thresh
+                    and (avg_link >= clean_sim_thresh - 0.04 or max_link >= clean_sim_thresh + 0.05)
+                    and c_sim > best_pair_sim
+                ):
+                    best_pair_sim = c_sim
+                    best_pair = (i, j)
+
+        if best_pair is not None:
+            i, j = best_pair
+            if clusters[j]["is_named"] or (
+                not clusters[i]["is_named"] and len(clusters[j]["det_ids"]) > len(clusters[i]["det_ids"])
+            ):
+                keep_idx, drop_idx = j, i
+            else:
+                keep_idx, drop_idx = i, j
+            keep = clusters[keep_idx]
+            drop = clusters[drop_idx]
+            keep["det_ids"].extend(drop["det_ids"])
+            keep["frame_keys"].update(drop["frame_keys"])
+            for anc in drop["anchors"]:
+                if len(keep["anchors"]) < 10:
+                    keep["anchors"].append(anc)
+            keep["centroid"] = compute_norm_mean(keep["anchors"])
+            clusters.pop(drop_idx)
+            merged_any = True
+
+    # 4. Persist clusters cleanly & remove obsolete unnamed persons
     reassigned_count = 0
     active_ids = set()
     for c in clusters:
+        if c["id"] is None:
+            created = db.create_person(name=c["name"], centroid=c["centroid"])
+            c["id"] = created["id"]
         active_ids.add(c["id"])
         cluster_dets = sorted(
             [det_by_id[did] for did in c["det_ids"] if did in det_by_id],
