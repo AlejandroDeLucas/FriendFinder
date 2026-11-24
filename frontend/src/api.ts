@@ -21,6 +21,7 @@ import {
   getBrowserJob,
   getBrowserStats,
   listBrowserJobs,
+  reassignBrowserDetection,
   searchByImageBrowser,
   updateBrowserDetectionStatus,
   uploadMediaBrowser,
@@ -466,6 +467,19 @@ export const api = {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status, discard_reason: discardReason }),
+    });
+  },
+
+  reassignDetection: async (
+    detId: string,
+    payload: { person_id?: string; new_person_name?: string }
+  ): Promise<Detection> => {
+    const mode = await initEngineMode();
+    if (mode === 'browser') return reassignBrowserDetection(detId, payload);
+    return request<Detection>(`/api/detections/${detId}/reassign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     });
   },
 

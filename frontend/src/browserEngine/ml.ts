@@ -112,6 +112,7 @@ async function ensureFaceModels(onStatus?: (msg: string) => void): Promise<void>
       try {
         await Promise.all([
           faceapi.nets.ssdMobilenetv1.loadFromUri(baseUrl),
+          faceapi.nets.tinyFaceDetector.loadFromUri(baseUrl),
           faceapi.nets.faceLandmark68TinyNet.loadFromUri(baseUrl),
           faceapi.nets.faceRecognitionNet.loadFromUri(baseUrl),
           faceapi.nets.faceExpressionNet.loadFromUri(baseUrl),
@@ -184,8 +185,8 @@ async function ensureMediaPipe(onStatus?: (msg: string) => void): Promise<void> 
               'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
           },
           runningMode: 'IMAGE',
-          scoreThreshold: 0.35,
-          maxResults: 16,
+          scoreThreshold: 0.3,
+          maxResults: 20,
         });
       } catch {
         objectDetectorInstance = null;
@@ -200,72 +201,109 @@ async function ensureMediaPipe(onStatus?: (msg: string) => void): Promise<void> 
   await mediaPipePromise;
 }
 
+function boxIoU(a: [number, number, number, number], b: [number, number, number, number]): number {
+  const ox = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+  const oy = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const inter = ox * oy;
+  if (inter <= 0) return 0;
+  const areaA = Math.max(1, (a[2] - a[0]) * (a[3] - a[1]));
+  const areaB = Math.max(1, (b[2] - b[0]) * (b[3] - b[1]));
+  return inter / (areaA + areaB - inter);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapRawFaceItem(item: any, w: number, h: number): BrowserFace {
+  const box = item.detection.box;
+  const x1 = Math.max(0, Math.min(w - 1, box.x));
+  const y1 = Math.max(0, Math.min(h - 1, box.y));
+  const x2 = Math.max(x1 + 1, Math.min(w, box.x + box.width));
+  const y2 = Math.max(y1 + 1, Math.min(h, box.y + box.height));
+
+  // Estimate frontality from 68-point eyes + nose symmetry
+  let frontality = 75;
+  try {
+    const leftEye = item.landmarks.getLeftEye();
+    const rightEye = item.landmarks.getRightEye();
+    const nose = item.landmarks.getNose();
+    const lx = leftEye.reduce((s: number, p: { x: number }) => s + p.x, 0) / leftEye.length;
+    const ly = leftEye.reduce((s: number, p: { y: number }) => s + p.y, 0) / leftEye.length;
+    const rx = rightEye.reduce((s: number, p: { x: number }) => s + p.x, 0) / rightEye.length;
+    const ry = rightEye.reduce((s: number, p: { y: number }) => s + p.y, 0) / rightEye.length;
+    const nx = nose[Math.floor(nose.length / 2)].x;
+    const eyeDist = Math.hypot(rx - lx, ry - ly);
+    if (eyeDist > 2) {
+      const midX = 0.5 * (lx + rx);
+      const horizOffset = Math.abs(nx - midX) / eyeDist;
+      const tilt = Math.abs(ry - ly) / eyeDist;
+      const penalty = Math.min(1, horizOffset * 1.45 + tilt * 0.8);
+      frontality = Math.max(15, Math.min(100, 100 * (1 - penalty)));
+    }
+  } catch {
+    frontality = 75;
+  }
+
+  let expression = 'neutral';
+  if (item.expressions) {
+    let bestVal = 0;
+    for (const [k, v] of Object.entries(item.expressions as Record<string, number>)) {
+      if (v > bestVal) {
+        bestVal = v;
+        expression = k;
+      }
+    }
+  }
+
+  return {
+    bbox: [x1, y1, x2, y2],
+    detScore: Number(item.detection.score || 0.7),
+    embedding: Array.from(item.descriptor as Float32Array),
+    frontality: Math.round(frontality * 10) / 10,
+    expression,
+  };
+}
+
 export async function detectFacesOnlyBrowser(
   canvas: HTMLCanvasElement,
   onStatus?: (msg: string) => void
 ): Promise<BrowserFace[]> {
   await ensureFaceModels(onStatus);
   const faceapi = faceApiMod;
-  const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.42 });
-  const raw = await faceapi
-    .detectAllFaces(canvas, options)
+  const w = canvas.width;
+  const h = canvas.height;
+
+  // Primary detector: SSD MobileNet v1 with sensitive threshold for dim/party/group scenes
+  const ssdOpts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.28, maxResults: 30 });
+  const rawSsd = await faceapi
+    .detectAllFaces(canvas, ssdOpts)
     .withFaceLandmarks(true)
     .withFaceExpressions()
     .withFaceDescriptors();
 
-  const w = canvas.width;
-  const h = canvas.height;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return raw.map((item: any) => {
-    const box = item.detection.box;
-    const x1 = Math.max(0, Math.min(w - 1, box.x));
-    const y1 = Math.max(0, Math.min(h - 1, box.y));
-    const x2 = Math.max(x1 + 1, Math.min(w, box.x + box.width));
-    const y2 = Math.max(y1 + 1, Math.min(h, box.y + box.height));
+  // Secondary detector: TinyFaceDetector catches smaller or angled people that SSD misses
+  const tinyOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.34 });
+  const rawTiny = await faceapi
+    .detectAllFaces(canvas, tinyOpts)
+    .withFaceLandmarks(true)
+    .withFaceExpressions()
+    .withFaceDescriptors();
 
-    // Estimate frontality from 68-point eyes + nose symmetry
-    let frontality = 75;
-    try {
-      const leftEye = item.landmarks.getLeftEye();
-      const rightEye = item.landmarks.getRightEye();
-      const nose = item.landmarks.getNose();
-      const lx = leftEye.reduce((s: number, p: { x: number }) => s + p.x, 0) / leftEye.length;
-      const ly = leftEye.reduce((s: number, p: { y: number }) => s + p.y, 0) / leftEye.length;
-      const rx = rightEye.reduce((s: number, p: { x: number }) => s + p.x, 0) / rightEye.length;
-      const ry = rightEye.reduce((s: number, p: { y: number }) => s + p.y, 0) / rightEye.length;
-      const nx = nose[Math.floor(nose.length / 2)].x;
-      const eyeDist = Math.hypot(rx - lx, ry - ly);
-      if (eyeDist > 2) {
-        const midX = 0.5 * (lx + rx);
-        const horizOffset = Math.abs(nx - midX) / eyeDist;
-        const tilt = Math.abs(ry - ly) / eyeDist;
-        const penalty = Math.min(1, horizOffset * 1.45 + tilt * 0.8);
-        frontality = Math.max(15, Math.min(100, 100 * (1 - penalty)));
-      }
-    } catch {
-      frontality = 75;
+  const merged: BrowserFace[] = [];
+  for (const item of rawSsd) {
+    merged.push(mapRawFaceItem(item, w, h));
+  }
+  for (const item of rawTiny) {
+    const candidate = mapRawFaceItem(item, w, h);
+    // Ignore tiny background false positives (< 26px)
+    if (Math.min(candidate.bbox[2] - candidate.bbox[0], candidate.bbox[3] - candidate.bbox[1]) < 26) {
+      continue;
     }
-
-    // Dominant facial expression
-    let expression = 'neutral';
-    if (item.expressions) {
-      let bestVal = 0;
-      for (const [k, v] of Object.entries(item.expressions as Record<string, number>)) {
-        if (v > bestVal) {
-          bestVal = v;
-          expression = k;
-        }
-      }
+    const overlapsExisting = merged.some((m) => boxIoU(m.bbox, candidate.bbox) > 0.38);
+    if (!overlapsExisting) {
+      merged.push(candidate);
     }
+  }
 
-    return {
-      bbox: [x1, y1, x2, y2],
-      detScore: Number(item.detection.score || 0.8),
-      embedding: Array.from(item.descriptor as Float32Array),
-      frontality: Math.round(frontality * 10) / 10,
-      expression,
-    } as BrowserFace;
-  });
+  return merged;
 }
 
 export async function analyzeFrameBrowser(
@@ -469,7 +507,7 @@ export function scoreDetectionBrowser(
 
   const { sharpness, lighting } = computeSharpnessAndLighting(ctx, face.bbox);
   const resScore = Math.min(100, Math.pow(minDim / 150, 0.75) * 100);
-  const detScore = Math.min(100, Math.max(0, ((face.detScore - 0.4) / 0.55) * 100));
+  const detScore = Math.min(100, Math.max(0, ((face.detScore - 0.25) / 0.7) * 100));
 
   const margin = Math.max(2, Math.floor(0.01 * Math.min(canvas.width, canvas.height)));
   const cutOff =
@@ -479,7 +517,7 @@ export function scoreDetectionBrowser(
     fy2 >= canvas.height - margin;
 
   const portraitScore =
-    (cutOff ? 0.85 : 1) *
+    (cutOff ? 0.8 : 1) *
     (0.32 * sharpness +
       0.25 * resScore +
       0.23 * face.frontality +
@@ -515,17 +553,21 @@ export function scoreDetectionBrowser(
   });
   const separation = Math.max(0, Math.min(100, 100 * (1 - Math.min(1, maxOverlap * 1.35))));
 
+  const bodyEdgeClipped = bx1 <= margin || bx2 >= canvas.width - margin || cutOff;
+  const bodyEdgeMult = bodyEdgeClipped ? 0.78 : 1.0;
+
   const bodyToFace = bh / fh;
   const aspect = bh / bw;
   const isFullBody = bodyToFace >= 3.4 && aspect >= 1.3;
   const bodyRes = Math.min(100, Math.pow(bh / 380, 0.7) * 100);
   const coverage = Math.min(100, (bodyToFace / 5.2) * 100);
   const bodyScore =
-    0.26 * bodyRes +
-    0.26 * coverage +
-    0.24 * separation +
-    0.14 * portraitScore +
-    0.1 * (hasMask ? 100 : 40);
+    bodyEdgeMult *
+    (0.24 * bodyRes +
+      0.24 * coverage +
+      0.24 * separation +
+      0.18 * portraitScore +
+      0.1 * (hasMask ? 100 : 40));
 
   const overall = Math.max(portraitScore, 0.58 * portraitScore + 0.42 * bodyScore);
 

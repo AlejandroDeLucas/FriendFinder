@@ -7,16 +7,18 @@ import {
   Eye,
   Film,
   Image as ImageIcon,
+  Layers,
   Play,
   RotateCcw,
   Scissors,
   Sparkles,
   Star,
   Trash2,
+  UserPlus,
   X,
 } from 'lucide-react';
 import { api, assetUrl, formatTime } from '../api';
-import type { Detection, PersonDetail as PersonDetailType } from '../types';
+import type { Detection, PersonDetail as PersonDetailType, PersonSummary } from '../types';
 
 interface Props {
   personId: string;
@@ -38,8 +40,9 @@ export function PersonDetail({
   onToast,
 }: Props) {
   const [person, setPerson] = useState<PersonDetailType | null>(null);
+  const [otherPersons, setOtherPersons] = useState<PersonSummary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [subtab, setSubtab] = useState<'kept' | 'discarded' | 'appearances'>('kept');
+  const [subtab, setSubtab] = useState<'kept' | 'all' | 'discarded' | 'appearances'>('kept');
   const [selectedDet, setSelectedDet] = useState<Detection | null>(null);
   const [formatView, setFormatView] = useState<FormatView>('portrait');
   const [editingName, setEditingName] = useState(false);
@@ -56,8 +59,12 @@ export function PersonDetail({
   const loadPerson = async (keepSelectionId?: string) => {
     setLoading(true);
     try {
-      const data = await api.getPerson(personId);
+      const [data, allPeople] = await Promise.all([
+        api.getPerson(personId),
+        api.listPersons(),
+      ]);
       setPerson(data);
+      setOtherPersons(allPeople.filter((p) => p.id !== personId));
       setNameDraft(data.name);
 
       const all = [...data.kept_detections, ...data.discarded_detections];
@@ -90,6 +97,60 @@ export function PersonDetail({
       await loadPerson(selectedDet?.id);
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error al renombrar');
+    }
+  };
+
+  const handleSplitToNewPerson = async (det: Detection) => {
+    const suggested = window.prompt(
+      '¿Qué nombre quieres ponerle a esta nueva persona? (déjalo vacío para asignarlo luego)',
+      ''
+    );
+    if (suggested === null) return;
+    setBusyAction(true);
+    try {
+      await api.reassignDetection(det.id, { new_person_name: suggested.trim() || undefined });
+      onToast(
+        suggested.trim()
+          ? `Separado como "${suggested.trim()}"`
+          : 'Separado en un nuevo perfil de persona'
+      );
+      onPersonChanged();
+      await loadPerson();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error al separar persona');
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleMoveToPerson = async (det: Detection, targetId: string) => {
+    if (!targetId) return;
+    const targetName = otherPersons.find((p) => p.id === targetId)?.name || 'otra persona';
+    setBusyAction(true);
+    try {
+      await api.reassignDetection(det.id, { person_id: targetId });
+      onToast(`Captura movida a "${targetName}"`);
+      onPersonChanged();
+      await loadPerson();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error al mover captura');
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleDeleteDetection = async (det: Detection) => {
+    if (!window.confirm('¿Eliminar esta captura borrosa o incorrecta?')) return;
+    setBusyAction(true);
+    try {
+      await api.deleteDetection(det.id);
+      onToast('Captura eliminada');
+      onPersonChanged();
+      await loadPerson();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error eliminando captura');
+    } finally {
+      setBusyAction(false);
     }
   };
 
@@ -201,7 +262,13 @@ export function PersonDetail({
     );
   }
 
-  const activeList = subtab === 'kept' ? person.kept_detections : person.discarded_detections;
+  const allDetections = [...person.kept_detections, ...person.discarded_detections];
+  const activeList =
+    subtab === 'kept'
+      ? person.kept_detections
+      : subtab === 'all'
+        ? allDetections
+        : person.discarded_detections;
 
   const getInspectorImage = (det: Detection | null): { url: string; downloadName: string; isCutout: boolean } => {
     if (!det) return { url: '', downloadName: 'image.jpg', isCutout: false };
@@ -469,7 +536,17 @@ export function PersonDetail({
             if (person.kept_detections[0]) setSelectedDet(person.kept_detections[0]);
           }}
         >
-          <Star size={15} /> Mejores capturas ({person.kept_detections.length})
+          <Star size={15} /> Mejores ({person.kept_detections.length})
+        </button>
+        <button
+          id="subtab-all"
+          className={`subtab ${subtab === 'all' ? 'active' : ''}`}
+          onClick={() => {
+            setSubtab('all');
+            if (allDetections[0]) setSelectedDet(allDetections[0]);
+          }}
+        >
+          <Layers size={15} /> Todas ({allDetections.length})
         </button>
         <button
           id="subtab-discarded"
@@ -479,7 +556,7 @@ export function PersonDetail({
             if (person.discarded_detections[0]) setSelectedDet(person.discarded_detections[0]);
           }}
         >
-          <RotateCcw size={15} /> Descartadas por calidad ({person.discarded_detections.length})
+          <RotateCcw size={15} /> Descartadas ({person.discarded_detections.length})
         </button>
         <button
           id="subtab-appearances"
@@ -793,6 +870,60 @@ export function PersonDetail({
                       'Descartar'
                     )}
                   </button>
+                </div>
+
+                {/* Split / Reassign Misgrouped Capture */}
+                <div
+                  style={{
+                    borderTop: '1px solid var(--border-hairline)',
+                    paddingTop: 12,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 8,
+                  }}
+                >
+                  <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--ink-secondary)' }}>
+                    ¿No es {person.name}? Corregir agrupación:
+                  </span>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <button
+                      id="btn-split-person"
+                      className="btn btn-sm"
+                      disabled={busyAction}
+                      onClick={() => handleSplitToNewPerson(selectedDet)}
+                    >
+                      <UserPlus size={14} /> Separar en nueva persona
+                    </button>
+
+                    {otherPersons.length > 0 && (
+                      <select
+                        className="select"
+                        style={{ width: 'auto', padding: '5px 9px', fontSize: '0.8rem' }}
+                        value=""
+                        disabled={busyAction}
+                        onChange={(e) => {
+                          if (e.target.value) void handleMoveToPerson(selectedDet, e.target.value);
+                        }}
+                      >
+                        <option value="">Mover a...</option>
+                        {otherPersons.map((op) => (
+                          <option key={op.id} value={op.id}>
+                            {op.name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+
+                    <button
+                      className="btn btn-danger btn-sm"
+                      style={{ padding: '6px 9px' }}
+                      disabled={busyAction}
+                      onClick={() => handleDeleteDetection(selectedDet)}
+                      title="Eliminar esta captura"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
                 </div>
               </div>
             </aside>

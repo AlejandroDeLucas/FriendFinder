@@ -129,6 +129,10 @@ def evaluate_keep_or_discard(
     max_bodies = int(settings.get("max_fullbody_per_person", "4"))
     min_gap = float(settings.get("min_video_gap_seconds", "1.5"))
 
+    existing_kept = database.list_detections_for_person(person_id, status="kept")
+    if len(existing_kept) == 0:
+        return "kept", "portrait", None
+
     if metrics.portrait_score < min_quality and metrics.body_score < min_quality + 8.0:
         reasons = []
         if metrics.sharpness_score < 35:
@@ -141,8 +145,6 @@ def evaluate_keep_or_discard(
             None,
             f"Calidad insuficiente ({metrics.overall_score:.0f}/100){detail}",
         )
-
-    existing_kept = database.list_detections_for_person(person_id, status="kept")
 
     # Avoid near-duplicate consecutive video frames from the same video unless meaningfully better
     if min_gap > 0:

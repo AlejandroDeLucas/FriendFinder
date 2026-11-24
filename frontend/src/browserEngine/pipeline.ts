@@ -113,41 +113,60 @@ async function makeMediaThumb(canvas: HTMLCanvasElement, mediaId: string): Promi
 
 async function matchOrCreateBrowserPerson(
   embedding: number[],
+  faceDetScore: number,
+  metrics: BrowserQualityMetrics,
   threshold: number,
   centroids: Map<string, PersonMatchEntry>
 ): Promise<{ personId: string; personName: string; isNew: boolean }> {
-  // Calibrated dlib 128-D Euclidean distance threshold (~0.60 at default threshold=0.45)
-  // Higher user threshold = stricter (smaller maxDist); lower = more permissive
-  const maxDist = Math.max(0.42, Math.min(0.72, 0.61 - (threshold - 0.45) * 0.5));
+  // Strict dlib 128-D Euclidean threshold (0.47 at default threshold=0.45):
+  // prevents merging different people while reliably matching the same person across clear frames.
+  const baseMaxDist = Math.max(0.36, Math.min(0.56, 0.47 - (threshold - 0.45) * 0.45));
+  const isCleanFrontal =
+    faceDetScore >= 0.62 && metrics.portrait_score >= 52 && metrics.frontality_score >= 48;
+  // Require an even tighter match for blurry or extreme-profile faces so they never pollute a cluster
+  const effectiveMaxDist = isCleanFrontal ? baseMaxDist : Math.max(0.34, baseMaxDist - 0.05);
+
   let bestId: string | null = null;
   let bestName = '';
-  let bestDist = Infinity;
+  let bestScoreDist = Infinity;
 
   for (const [pid, info] of centroids.entries()) {
-    let dist = euclideanDistance(embedding, info.vec);
-    for (const ex of info.exemplars) {
-      const d = euclideanDistance(embedding, ex);
-      if (d < dist) dist = d;
-    }
-    if (dist < bestDist) {
-      bestDist = dist;
+    const centroidDist = euclideanDistance(embedding, info.vec);
+    // Avoid single-linkage chaining: require BOTH centroid AND average of top-3 closest exemplars to agree
+    const exDists = info.exemplars
+      .map((ex) => euclideanDistance(embedding, ex))
+      .sort((a, b) => a - b);
+    const topK = exDists.slice(0, Math.min(3, exDists.length));
+    const avgTopDist =
+      topK.length > 0 ? topK.reduce((s, d) => s + d, 0) / topK.length : centroidDist;
+    const combinedDist = 0.55 * centroidDist + 0.45 * avgTopDist;
+
+    if (
+      centroidDist <= effectiveMaxDist + 0.03 &&
+      avgTopDist <= effectiveMaxDist &&
+      combinedDist < bestScoreDist
+    ) {
+      bestScoreDist = combinedDist;
       bestId = pid;
       bestName = info.name;
     }
   }
 
-  if (bestId && bestDist <= maxDist) {
-    const cur = centroids.get(bestId)!;
-    const nextCount = cur.count + 1;
-    const nextVec = cur.vec.map((v, i) => (v * cur.count + embedding[i]) / nextCount);
-    const nextExemplars =
-      cur.exemplars.length < 8 ? [...cur.exemplars, [...embedding]] : cur.exemplars;
-    centroids.set(bestId, {
-      name: cur.name,
-      vec: nextVec,
-      exemplars: nextExemplars,
-      count: nextCount,
-    });
+  if (bestId && bestScoreDist <= effectiveMaxDist) {
+    // Only clean, well-framed faces may update the running centroid/exemplars (prevents cluster drift!)
+    if (isCleanFrontal) {
+      const cur = centroids.get(bestId)!;
+      const nextCount = cur.count + 1;
+      const nextVec = cur.vec.map((v, i) => (v * cur.count + embedding[i]) / nextCount);
+      const nextExemplars =
+        cur.exemplars.length < 8 ? [...cur.exemplars, [...embedding]] : cur.exemplars;
+      centroids.set(bestId, {
+        name: cur.name,
+        vec: nextVec,
+        exemplars: nextExemplars,
+        count: nextCount,
+      });
+    }
     return { personId: bestId, personName: bestName, isNew: false };
   }
 
@@ -189,6 +208,16 @@ async function evaluateKeepOrDiscardBrowser(
   const maxBodies = Number(settings.max_fullbody_per_person || '4');
   const minGap = Number(settings.min_video_gap_seconds || '1.5');
 
+  const existingKept = (await getAllStoredDetections()).filter(
+    (d) => d.person_id === personId && d.status === 'kept'
+  );
+
+  // NEVER silently discard a person's very first / only capture!
+  // Every detected person always keeps at least their best capture so the user can see and inspect them.
+  if (existingKept.length === 0) {
+    return { status: 'kept', keepCategory: 'portrait', discardReason: null };
+  }
+
   if (metrics.portrait_score < minQuality && metrics.body_score < minQuality + 8) {
     const reasons: string[] = [];
     if (metrics.sharpness_score < 35) reasons.push('borrosa');
@@ -200,10 +229,6 @@ async function evaluateKeepOrDiscardBrowser(
       discardReason: `Calidad insuficiente (${metrics.overall_score.toFixed(0)}/100)${detail}`,
     };
   }
-
-  const existingKept = (await getAllStoredDetections()).filter(
-    (d) => d.person_id === personId && d.status === 'kept'
-  );
 
   if (minGap > 0) {
     for (const ex of existingKept) {
@@ -334,6 +359,8 @@ async function processFrameCanvas(
 
     const { personId, personName, isNew } = await matchOrCreateBrowserPerson(
       face.embedding,
+      face.detScore,
+      metrics,
       threshold,
       centroids
     );
@@ -615,8 +642,8 @@ async function processVideoInBrowser(
     duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
     const rawW = video.videoWidth || 640;
     const rawH = video.videoHeight || 480;
-    // Cap video analysis canvas at 960px for fast, smooth mobile decoding even on 1:30+ 4K videos
-    const scale = Math.min(1, 960 / Math.max(1, rawW, rawH));
+    // Cap video analysis canvas at 1200px so smaller/further-back faces remain detectable
+    const scale = Math.min(1, 1200 / Math.max(1, rawW, rawH));
     w = Math.max(1, Math.round(rawW * scale));
     h = Math.max(1, Math.round(rawH * scale));
 
@@ -1331,4 +1358,50 @@ export async function exportZipBrowser(payload: {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+export async function reassignBrowserDetection(
+  detId: string,
+  payload: { person_id?: string; new_person_name?: string }
+): Promise<Detection> {
+  const det = await getStoredDetection(detId);
+  if (!det) throw new Error('Detección no encontrada');
+
+  const oldPersonId = det.person_id;
+  let targetPersonId = payload.person_id;
+
+  if (!targetPersonId) {
+    const allPersons = await getAllStoredPersons();
+    const newName = (payload.new_person_name || '').trim() || `Persona ${allPersons.length + 1}`;
+    const now = new Date().toISOString();
+    const newPerson: StoredPerson = {
+      id: uid(),
+      name: newName,
+      notes: '',
+      centroid: det.embedding ? [...det.embedding] : null,
+      cover_detection_id: det.id,
+      best_portrait_id: det.id,
+      best_body_id: det.has_cutout ? det.id : null,
+      is_ignored: 0,
+      created_at: now,
+      updated_at: now,
+    };
+    await savePerson(newPerson);
+    targetPersonId = newPerson.id;
+  }
+
+  const updated: StoredDetection = {
+    ...det,
+    person_id: targetPersonId,
+    status: 'kept',
+    discard_reason: null,
+  };
+  await saveDetection(updated);
+
+  if (oldPersonId && oldPersonId !== targetPersonId) {
+    await recomputeBrowserPersonStats(oldPersonId);
+  }
+  await recomputeBrowserPersonStats(targetPersonId);
+  const { embedding: _e, ...clean } = updated;
+  return clean;
 }
