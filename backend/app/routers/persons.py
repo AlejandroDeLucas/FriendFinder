@@ -12,6 +12,7 @@ from ..config import FRAMES_DIR, PORTRAITS_DIR
 from ..database import db
 from ..schemas import ExportRequest, MergePersonsRequest, PersonUpdateRequest, SceneAnalyzeRequest
 from ..services.exporter import build_export_zip
+from ..services.pipeline import recluster_all_persons
 from ..services.scene_analyzer import scene_analyzer
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
@@ -20,6 +21,12 @@ router = APIRouter(prefix="/api/persons", tags=["persons"])
 @router.get("")
 def list_persons(include_ignored: bool = Query(default=False)) -> list[dict[str, Any]]:
     return db.list_persons(include_ignored=include_ignored)
+
+
+@router.post("/recluster")
+def recluster_persons() -> dict[str, int]:
+    """Re-cluster all stored detections using strict complete-linkage clustering while preserving custom names."""
+    return recluster_all_persons(database=db)
 
 
 @router.get("/{person_id}")

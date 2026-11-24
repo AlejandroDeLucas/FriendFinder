@@ -78,7 +78,7 @@ class ModelManager:
                 root=str(MODELS_DIR / "insightface"),
                 providers=providers,
             )
-            app.prepare(ctx_id=ctx_id, det_size=(640, 640), det_thresh=0.45)
+            app.prepare(ctx_id=ctx_id, det_size=(640, 640), det_thresh=0.38)
             self._face_app = app
             self._face_pack = pack
             return self._face_app
@@ -108,11 +108,24 @@ class ModelManager:
             self._yolo_name = model_name
             return self._yolo_model
 
+    @staticmethod
+    def _enhance_low_light(image_bgr: np.ndarray) -> np.ndarray:
+        """Apply gentle LAB CLAHE enhancement only on dim party/night frames for higher face recall."""
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        if float(np.mean(gray)) >= 88.0:
+            return image_bgr
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        l_enh = clahe.apply(l_ch)
+        return cv2.cvtColor(cv2.merge([l_enh, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
     def detect_faces_only(self, image_bgr: np.ndarray, pack: str = "buffalo_l") -> list[DetectedFace]:
-        """Run InsightFace face detection + ArcFace embedding extraction."""
+        """Run InsightFace face detection + ArcFace embedding extraction with low-light enhancement."""
         app = self._ensure_face_app(pack=pack)
+        det_img = self._enhance_low_light(image_bgr)
         with self._lock:
-            raw_faces = app.get(image_bgr)
+            raw_faces = app.get(det_img)
 
         results: list[DetectedFace] = []
         h, w = image_bgr.shape[:2]
@@ -132,6 +145,11 @@ class ModelManager:
             x2 = max(x1 + 1.0, min(float(w), x2))
             y2 = max(y1 + 1.0, min(float(h), y2))
 
+            fw = x2 - x1
+            fh = y2 - y1
+            if min(fw, fh) < 22.0 or not (0.45 <= fw / max(1.0, fh) <= 1.75):
+                continue
+
             pose_arr = getattr(f, "pose", None)
             pose_tuple = None
             if pose_arr is not None and len(pose_arr) >= 3:
@@ -139,6 +157,12 @@ class ModelManager:
 
             kps = getattr(f, "kps", None)
             kps_arr = np.asarray(kps, dtype=np.float32) if kps is not None else None
+            # Reject inverted/corrupted 5-point landmarks
+            if kps_arr is not None and kps_arr.shape == (5, 2):
+                eye_y = 0.5 * (kps_arr[0][1] + kps_arr[1][1])
+                mouth_y = 0.5 * (kps_arr[3][1] + kps_arr[4][1])
+                if mouth_y <= eye_y + 0.1 * fh:
+                    continue
 
             results.append(
                 DetectedFace(

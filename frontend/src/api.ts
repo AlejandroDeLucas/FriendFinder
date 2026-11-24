@@ -22,6 +22,7 @@ import {
   getBrowserStats,
   listBrowserJobs,
   reassignBrowserDetection,
+  reclusterAllBrowserPersons,
   searchByImageBrowser,
   updateBrowserDetectionStatus,
   uploadMediaBrowser,
@@ -332,6 +333,16 @@ export const api = {
     const mode = await initEngineMode();
     if (mode === 'browser') return deleteBrowserPerson(personId);
     return request<{ deleted: boolean }>(`/api/persons/${personId}`, { method: 'DELETE' });
+  },
+
+  reclusterPersons: async (): Promise<{
+    persons_before: number;
+    persons_after: number;
+    reassigned_count: number;
+  }> => {
+    const mode = await initEngineMode();
+    if (mode === 'browser') return reclusterAllBrowserPersons();
+    return request('/api/persons/recluster', { method: 'POST' });
   },
 
   analyzePersonScenes: async (

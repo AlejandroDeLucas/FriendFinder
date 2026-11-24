@@ -113,7 +113,7 @@ async function ensureFaceModels(onStatus?: (msg: string) => void): Promise<void>
         await Promise.all([
           faceapi.nets.ssdMobilenetv1.loadFromUri(baseUrl),
           faceapi.nets.tinyFaceDetector.loadFromUri(baseUrl),
-          faceapi.nets.faceLandmark68TinyNet.loadFromUri(baseUrl),
+          faceapi.nets.faceLandmark68Net.loadFromUri(baseUrl),
           faceapi.nets.faceRecognitionNet.loadFromUri(baseUrl),
           faceapi.nets.faceExpressionNet.loadFromUri(baseUrl),
         ]);
@@ -137,13 +137,15 @@ async function ensureFaceModels(onStatus?: (msg: string) => void): Promise<void>
   }
 }
 
+let segmenterIsMulticlass = false;
+
 async function ensureMediaPipe(onStatus?: (msg: string) => void): Promise<void> {
   if (mediaPipeTried) return;
   if (mediaPipePromise) return mediaPipePromise;
 
   mediaPipePromise = (async () => {
     try {
-      onStatus?.('Cargando segmentación PNG sin fondo...');
+      onStatus?.('Cargando segmentación HD de silueta PNG...');
       const vision = await import('@mediapipe/tasks-vision');
       let fileset = null;
       for (const wasmBase of [
@@ -162,19 +164,34 @@ async function ensureMediaPipe(onStatus?: (msg: string) => void): Promise<void> 
         return;
       }
 
-      // Tiny 250KB selfie/person segmenter for transparent PNG cutouts
+      // Prefer 6-class multiclass segmenter (hair, skin, clothes, accessories) for much cleaner edges;
+      // fall back to lightweight selfie_segmenter if unavailable.
       try {
         segmenterInstance = await vision.ImageSegmenter.createFromOptions(fileset, {
           baseOptions: {
             modelAssetPath:
-              'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
+              'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite',
           },
           runningMode: 'IMAGE',
           outputCategoryMask: false,
           outputConfidenceMasks: true,
         });
+        segmenterIsMulticlass = true;
       } catch {
-        segmenterInstance = null;
+        try {
+          segmenterInstance = await vision.ImageSegmenter.createFromOptions(fileset, {
+            baseOptions: {
+              modelAssetPath:
+                'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
+            },
+            runningMode: 'IMAGE',
+            outputCategoryMask: false,
+            outputConfidenceMasks: true,
+          });
+          segmenterIsMulticlass = false;
+        } catch {
+          segmenterInstance = null;
+        }
       }
 
       // Lightweight COCO object detector for individual person boxes + context objects
@@ -185,8 +202,8 @@ async function ensureMediaPipe(onStatus?: (msg: string) => void): Promise<void> 
               'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
           },
           runningMode: 'IMAGE',
-          scoreThreshold: 0.3,
-          maxResults: 20,
+          scoreThreshold: 0.28,
+          maxResults: 24,
         });
       } catch {
         objectDetectorInstance = null;
@@ -211,35 +228,98 @@ function boxIoU(a: [number, number, number, number], b: [number, number, number,
   return inter / (areaA + areaB - inter);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function mapRawFaceItem(item: any, w: number, h: number): BrowserFace {
-  const box = item.detection.box;
-  const x1 = Math.max(0, Math.min(w - 1, box.x));
-  const y1 = Math.max(0, Math.min(h - 1, box.y));
-  const x2 = Math.max(x1 + 1, Math.min(w, box.x + box.width));
-  const y2 = Math.max(y1 + 1, Math.min(h, box.y + box.height));
+/** Lighten dark party/indoor frames into a temporary detection canvas without altering the original frame. */
+function buildEnhancedDetectionCanvas(source: HTMLCanvasElement): HTMLCanvasElement {
+  const w = source.width;
+  const h = source.height;
+  // Quick luminance probe on tiny 64x64 downsample
+  const probe = document.createElement('canvas');
+  probe.width = 64;
+  probe.height = 64;
+  const pctx = probe.getContext('2d')!;
+  pctx.drawImage(source, 0, 0, 64, 64);
+  const pd = pctx.getImageData(0, 0, 64, 64).data;
+  let lumaSum = 0;
+  for (let i = 0; i < pd.length; i += 4) {
+    lumaSum += 0.299 * pd[i] + 0.587 * pd[i + 1] + 0.114 * pd[i + 2];
+  }
+  const meanLuma = lumaSum / (64 * 64);
+  if (meanLuma >= 105) {
+    return source;
+  }
 
-  // Estimate frontality from 68-point eyes + nose symmetry
+  // Apply gentle gamma lift + contrast boost for dim scenes so background & shadowed faces pop out
+  const gamma = meanLuma < 65 ? 0.65 : 0.78;
+  const lut = new Uint8ClampedArray(256);
+  for (let i = 0; i < 256; i++) {
+    lut[i] = Math.min(255, Math.round(Math.pow(i / 255, gamma) * 255));
+  }
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext('2d')!;
+  octx.drawImage(source, 0, 0);
+  const imgData = octx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = lut[d[i]];
+    d[i + 1] = lut[d[i + 1]];
+    d[i + 2] = lut[d[i + 2]];
+  }
+  octx.putImageData(imgData, 0, 0);
+  return out;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapAndValidateFaceItem(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  item: any,
+  w: number,
+  h: number,
+  offsetX = 0,
+  offsetY = 0
+): BrowserFace | null {
+  const box = item.detection.box;
+  const x1 = Math.max(0, Math.min(w - 1, box.x + offsetX));
+  const y1 = Math.max(0, Math.min(h - 1, box.y + offsetY));
+  const x2 = Math.max(x1 + 1, Math.min(w, box.x + box.width + offsetX));
+  const y2 = Math.max(y1 + 1, Math.min(h, box.y + box.height + offsetY));
+  const fw = x2 - x1;
+  const fh = y2 - y1;
+
+  // Reject tiny specks or absurdly stretched non-face false positives (e.g. blurry chin/arm)
+  if (Math.min(fw, fh) < 24) return null;
+  const ratio = fw / Math.max(1, fh);
+  if (ratio < 0.45 || ratio > 1.75) return null;
+
+  // Validate anatomical 68-point geometry (eyes above nose, nose above mouth, sane eye spacing)
   let frontality = 75;
   try {
     const leftEye = item.landmarks.getLeftEye();
     const rightEye = item.landmarks.getRightEye();
     const nose = item.landmarks.getNose();
+    const mouth = item.landmarks.getMouth();
     const lx = leftEye.reduce((s: number, p: { x: number }) => s + p.x, 0) / leftEye.length;
     const ly = leftEye.reduce((s: number, p: { y: number }) => s + p.y, 0) / leftEye.length;
     const rx = rightEye.reduce((s: number, p: { x: number }) => s + p.x, 0) / rightEye.length;
     const ry = rightEye.reduce((s: number, p: { y: number }) => s + p.y, 0) / rightEye.length;
-    const nx = nose[Math.floor(nose.length / 2)].x;
+    const noseTip = nose[Math.floor(nose.length / 2)];
+    const mouthY = mouth.reduce((s: number, p: { y: number }) => s + p.y, 0) / mouth.length;
+    const eyeMidY = 0.5 * (ly + ry);
     const eyeDist = Math.hypot(rx - lx, ry - ly);
-    if (eyeDist > 2) {
-      const midX = 0.5 * (lx + rx);
-      const horizOffset = Math.abs(nx - midX) / eyeDist;
-      const tilt = Math.abs(ry - ly) / eyeDist;
-      const penalty = Math.min(1, horizOffset * 1.45 + tilt * 0.8);
-      frontality = Math.max(15, Math.min(100, 100 * (1 - penalty)));
-    }
+
+    // Reject inverted/corrupted landmarks (common on blurry partial chins/objects)
+    if (eyeDist < 0.14 * fw) return null;
+    if (mouthY <= eyeMidY + 0.12 * fh) return null;
+    if (noseTip.y < eyeMidY - 0.15 * fh || noseTip.y > mouthY + 0.1 * fh) return null;
+
+    const midX = 0.5 * (lx + rx);
+    const horizOffset = Math.abs(noseTip.x - midX) / eyeDist;
+    const tilt = Math.abs(ry - ly) / eyeDist;
+    const penalty = Math.min(1, horizOffset * 1.45 + tilt * 0.8);
+    frontality = Math.max(12, Math.min(100, 100 * (1 - penalty)));
   } catch {
-    frontality = 75;
+    return null;
   }
 
   let expression = 'neutral';
@@ -262,6 +342,17 @@ function mapRawFaceItem(item: any, w: number, h: number): BrowserFace {
   };
 }
 
+function mergeFaceCandidates(existing: BrowserFace[], incoming: BrowserFace | null): void {
+  if (!incoming) return;
+  const dupIdx = existing.findIndex((m) => boxIoU(m.bbox, incoming.bbox) > 0.36);
+  if (dupIdx === -1) {
+    existing.push(incoming);
+  } else if (incoming.detScore > existing[dupIdx].detScore + 0.05) {
+    // Keep the higher-confidence detection & embedding (e.g. from zoomed tile)
+    existing[dupIdx] = incoming;
+  }
+}
+
 export async function detectFacesOnlyBrowser(
   canvas: HTMLCanvasElement,
   onStatus?: (msg: string) => void
@@ -271,35 +362,54 @@ export async function detectFacesOnlyBrowser(
   const w = canvas.width;
   const h = canvas.height;
 
-  // Primary detector: SSD MobileNet v1 with sensitive threshold for dim/party/group scenes
-  const ssdOpts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.28, maxResults: 30 });
-  const rawSsd = await faceapi
-    .detectAllFaces(canvas, ssdOpts)
-    .withFaceLandmarks(true)
-    .withFaceExpressions()
-    .withFaceDescriptors();
-
-  // Secondary detector: TinyFaceDetector catches smaller or angled people that SSD misses
-  const tinyOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.34 });
-  const rawTiny = await faceapi
-    .detectAllFaces(canvas, tinyOpts)
-    .withFaceLandmarks(true)
-    .withFaceExpressions()
-    .withFaceDescriptors();
-
+  // Lift dim party/indoor frames for detection (embeddings still benefit hugely from clearer lighting!)
+  const detCanvas = buildEnhancedDetectionCanvas(canvas);
   const merged: BrowserFace[] = [];
+
+  // Pass 1: Full-frame SSD MobileNet v1 + full 68-point landmarks
+  const ssdOpts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.26, maxResults: 30 });
+  const rawSsd = await faceapi
+    .detectAllFaces(detCanvas, ssdOpts)
+    .withFaceLandmarks(false)
+    .withFaceExpressions()
+    .withFaceDescriptors();
   for (const item of rawSsd) {
-    merged.push(mapRawFaceItem(item, w, h));
+    mergeFaceCandidates(merged, mapAndValidateFaceItem(item, w, h));
   }
+
+  // Pass 2: TinyFaceDetector at 512px catches smaller or angled faces that SSD misses
+  const tinyOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.32 });
+  const rawTiny = await faceapi
+    .detectAllFaces(detCanvas, tinyOpts)
+    .withFaceLandmarks(false)
+    .withFaceExpressions()
+    .withFaceDescriptors();
   for (const item of rawTiny) {
-    const candidate = mapRawFaceItem(item, w, h);
-    // Ignore tiny background false positives (< 26px)
-    if (Math.min(candidate.bbox[2] - candidate.bbox[0], candidate.bbox[3] - candidate.bbox[1]) < 26) {
-      continue;
-    }
-    const overlapsExisting = merged.some((m) => boxIoU(m.bbox, candidate.bbox) > 0.38);
-    if (!overlapsExisting) {
-      merged.push(candidate);
+    mergeFaceCandidates(merged, mapAndValidateFaceItem(item, w, h));
+  }
+
+  // Pass 3: On wide/high-res group scenes, run 2 overlapping horizontal zoomed tiles
+  // so people in the background/sides are detected & embedded at nearly 2x effective resolution!
+  if (w >= 900) {
+    const tileW = Math.round(w * 0.58);
+    const offsets = [0, w - tileW];
+    const tileCanvas = document.createElement('canvas');
+    tileCanvas.width = tileW;
+    tileCanvas.height = h;
+    const tctx = tileCanvas.getContext('2d')!;
+    const tileSsdOpts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.34, maxResults: 20 });
+
+    for (const ox of offsets) {
+      tctx.clearRect(0, 0, tileW, h);
+      tctx.drawImage(detCanvas, ox, 0, tileW, h, 0, 0, tileW, h);
+      const tileRaw = await faceapi
+        .detectAllFaces(tileCanvas, tileSsdOpts)
+        .withFaceLandmarks(false)
+        .withFaceExpressions()
+        .withFaceDescriptors();
+      for (const item of tileRaw) {
+        mergeFaceCandidates(merged, mapAndValidateFaceItem(item, w, h, ox, 0));
+      }
     }
   }
 
@@ -354,11 +464,23 @@ export async function analyzeFrameBrowser(
       const segRes = segmenterInstance.segment(canvas);
       const masks = segRes.confidenceMasks;
       if (masks && masks.length > 0) {
-        // Selfie segmenter: index 0 or 1 depending on model; check class with foreground
-        const maskObj = masks.length > 1 ? masks[1] : masks[0];
-        maskWidth = maskObj.width;
-        maskHeight = maskObj.height;
-        personMask = new Float32Array(maskObj.getAsFloat32Array());
+        if (segmenterIsMulticlass && masks.length >= 2) {
+          // Class 0 = background; foreground person (hair + body-skin + face-skin + clothes + accessories) = 1 - bg
+          const bgMask = masks[0];
+          maskWidth = bgMask.width;
+          maskHeight = bgMask.height;
+          const bgArr = bgMask.getAsFloat32Array();
+          const fg = new Float32Array(bgArr.length);
+          for (let i = 0; i < bgArr.length; i++) {
+            fg[i] = Math.max(0, Math.min(1, 1 - bgArr[i]));
+          }
+          personMask = fg;
+        } else {
+          const maskObj = masks.length > 1 ? masks[1] : masks[0];
+          maskWidth = maskObj.width;
+          maskHeight = maskObj.height;
+          personMask = new Float32Array(maskObj.getAsFloat32Array());
+        }
       }
       segRes.close?.();
     } catch {

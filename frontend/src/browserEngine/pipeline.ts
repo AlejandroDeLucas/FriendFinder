@@ -12,6 +12,7 @@ import {
   type StoredDetection,
   type StoredMedia,
   type StoredPerson,
+  deleteBrowserPerson,
   ensureBlobsHydrated,
   getAllStoredDetections,
   getAllStoredPersons,
@@ -963,31 +964,36 @@ export async function uploadMediaBrowser(
         });
       }
 
-      for (const pid of affectedPersons) {
-        await recomputeBrowserPersonStats(pid);
-      }
+      updateJob({ current_step: 'Refinando agrupación de personas (alta precisión)...' });
+      await reclusterAllBrowserPersons();
 
-      // Build detected_persons list so user can name new friends or see auto-recognized names immediately
-      const latestSummaries = await listBrowserPersons();
-      const summaryMap = new Map(latestSummaries.map((p) => [p.id, p]));
-      const detectedPersons = Array.from(batchPersonTracker.entries())
-        .map(([pid, info]) => {
-          const p = summaryMap.get(pid);
-          if (!p) return null;
-          return {
-            id: p.id,
-            name: p.name,
-            is_new: info.isNew,
-            thumb_path:
-              p.cover_detection?.portrait_path ||
-              p.cover_detection?.thumb_path ||
-              p.best_portrait?.portrait_path ||
-              p.best_portrait?.thumb_path ||
-              null,
-            captures_in_batch: info.count,
-          };
-        })
-        .filter((x): x is NonNullable<typeof x> => x !== null);
+      // Build detected_persons list from the refined pure clusters so user sees clean separated people
+      const [latestSummaries, allFinalDets] = await Promise.all([
+        listBrowserPersons(),
+        getAllStoredDetections(),
+      ]);
+      const batchMediaIds = new Set(validPairs.map((p) => p.media.id));
+      const preexistingIds = new Set(existingPersons.map((p) => p.id));
+      const countsByPerson = new Map<string, number>();
+      for (const d of allFinalDets) {
+        if (batchMediaIds.has(d.media_id) && d.person_id) {
+          countsByPerson.set(d.person_id, (countsByPerson.get(d.person_id) || 0) + 1);
+        }
+      }
+      const detectedPersons = latestSummaries
+        .filter((p) => countsByPerson.has(p.id))
+        .map((p) => ({
+          id: p.id,
+          name: p.name,
+          is_new: !preexistingIds.has(p.id),
+          thumb_path:
+            p.cover_detection?.portrait_path ||
+            p.cover_detection?.thumb_path ||
+            p.best_portrait?.portrait_path ||
+            p.best_portrait?.thumb_path ||
+            null,
+          captures_in_batch: countsByPerson.get(p.id) || 1,
+        }));
 
       updateJob({
         status: 'done',
@@ -1404,4 +1410,201 @@ export async function reassignBrowserDetection(
   await recomputeBrowserPersonStats(targetPersonId);
   const { embedding: _e, ...clean } = updated;
   return clean;
+}
+
+/**
+ * Global complete-linkage quality-first re-clustering across all stored detections.
+ * - Preserves all user-named friends (anchored on their cover/best frontal detection).
+ * - Processes sharpest frontal faces first so blurry/profile frames can never cause cluster drift.
+ * - Uses complete-linkage anchor checks so two different people can never be chained together.
+ */
+export async function reclusterAllBrowserPersons(): Promise<{
+  persons_before: number;
+  persons_after: number;
+  reassigned_count: number;
+}> {
+  const [settings, existingPersons, allDets] = await Promise.all([
+    getBrowserSettings(),
+    getAllStoredPersons(),
+    getAllStoredDetections(),
+  ]);
+  const personsBefore = existingPersons.length;
+  if (allDets.length === 0) {
+    return { persons_before: personsBefore, persons_after: personsBefore, reassigned_count: 0 };
+  }
+
+  const threshold = Number(settings.similarity_threshold || '0.45');
+  const maxDist = Math.max(0.35, Math.min(0.54, 0.46 - (threshold - 0.45) * 0.45));
+  const detById = new Map(allDets.map((d) => [d.id, d]));
+
+  interface Cluster {
+    id: string;
+    name: string;
+    notes: string;
+    isNamed: boolean;
+    centroid: number[];
+    anchors: number[][];
+    detIds: string[];
+  }
+
+  const clusters: Cluster[] = [];
+  const assignedDetIds = new Set<string>();
+
+  // 1. Seed user-named persons on their cover (or sharpest frontal) detection so names are preserved cleanly
+  const isCustomName = (n: string) => !/^Persona \d+$/i.test(n.trim());
+  for (const p of existingPersons) {
+    if (!isCustomName(p.name)) continue;
+    const coverDet = p.cover_detection_id ? detById.get(p.cover_detection_id) : undefined;
+    const bestDet =
+      coverDet && Array.isArray(coverDet.embedding)
+        ? coverDet
+        : allDets
+            .filter((d) => d.person_id === p.id && Array.isArray(d.embedding))
+            .sort((a, b) => b.portrait_score - a.portrait_score)[0];
+    if (!bestDet || !bestDet.embedding) continue;
+
+    clusters.push({
+      id: p.id,
+      name: p.name,
+      notes: p.notes || '',
+      isNamed: true,
+      centroid: [...bestDet.embedding],
+      anchors: [[...bestDet.embedding]],
+      detIds: [bestDet.id],
+    });
+    assignedDetIds.add(bestDet.id);
+  }
+
+  // 2. Sort remaining detections by quality + frontality DESC so crisp frontal faces build pure clusters first
+  const remaining = allDets
+    .filter((d) => !assignedDetIds.has(d.id) && Array.isArray(d.embedding) && d.embedding.length > 0)
+    .sort(
+      (a, b) =>
+        b.portrait_score + 0.35 * b.frontality_score - (a.portrait_score + 0.35 * a.frontality_score)
+    );
+
+  let autoCounter = 1;
+  const nextAutoName = () => {
+    const used = new Set(clusters.map((c) => c.name));
+    while (used.has(`Persona ${autoCounter}`)) autoCounter++;
+    return `Persona ${autoCounter++}`;
+  };
+
+  for (const det of remaining) {
+    const emb = det.embedding!;
+    const isCleanFrontal =
+      det.det_score >= 0.55 && det.portrait_score >= 48 && det.frontality_score >= 45;
+    const localMaxDist = isCleanFrontal ? maxDist : Math.max(0.34, maxDist - 0.05);
+
+    let bestCluster: Cluster | null = null;
+    let bestCombined = Infinity;
+
+    for (const c of clusters) {
+      const cDist = euclideanDistance(emb, c.centroid);
+      const anchorDists = c.anchors.map((a) => euclideanDistance(emb, a));
+      const maxAnchorDist = Math.max(...anchorDists);
+      const avgAnchorDist = anchorDists.reduce((s, v) => s + v, 0) / anchorDists.length;
+
+      // Complete-linkage check: must agree with centroid AND not contradict existing anchors
+      if (
+        cDist <= localMaxDist + 0.02 &&
+        avgAnchorDist <= localMaxDist &&
+        maxAnchorDist <= localMaxDist + 0.08
+      ) {
+        const score = 0.55 * cDist + 0.45 * avgAnchorDist;
+        if (score < bestCombined) {
+          bestCombined = score;
+          bestCluster = c;
+        }
+      }
+    }
+
+    if (bestCluster) {
+      bestCluster.detIds.push(det.id);
+      if (isCleanFrontal && bestCluster.anchors.length < 6) {
+        bestCluster.anchors.push([...emb]);
+        // Recompute pure centroid from anchors only
+        const dim = emb.length;
+        const mean = new Array<number>(dim).fill(0);
+        for (const a of bestCluster.anchors) {
+          for (let i = 0; i < dim; i++) mean[i] += a[i];
+        }
+        bestCluster.centroid = mean.map((v) => v / bestCluster.anchors.length);
+      }
+    } else {
+      clusters.push({
+        id: uid(),
+        name: nextAutoName(),
+        notes: '',
+        isNamed: false,
+        centroid: [...emb],
+        anchors: [[...emb]],
+        detIds: [det.id],
+      });
+    }
+  }
+
+  // 3. Persist new clusters cleanly & remove obsolete person rows
+  const keptPersonIds = new Set(clusters.map((c) => c.id));
+  for (const oldP of existingPersons) {
+    if (!keptPersonIds.has(oldP.id)) {
+      // Remove empty/obsolete person record directly via deleteBrowserPerson only after reassigning
+      await savePerson({ ...oldP, is_ignored: 1 });
+    }
+  }
+
+  let reassignedCount = 0;
+  const now = new Date().toISOString();
+
+  for (const c of clusters) {
+    const existing = existingPersons.find((p) => p.id === c.id);
+    await savePerson({
+      id: c.id,
+      name: c.name,
+      notes: c.notes,
+      centroid: c.centroid,
+      cover_detection_id: existing?.cover_detection_id || c.detIds[0] || null,
+      best_portrait_id: c.detIds[0] || null,
+      best_body_id: null,
+      is_ignored: 0,
+      created_at: existing?.created_at || now,
+      updated_at: now,
+    });
+
+    // Guarantee at least the best detection in this cluster is marked 'kept'
+    const clusterDets = c.detIds
+      .map((id) => detById.get(id))
+      .filter((d): d is StoredDetection => Boolean(d))
+      .sort((a, b) => b.overall_score - a.overall_score);
+
+    const hasKept = clusterDets.some((d) => d.status === 'kept');
+    for (let i = 0; i < clusterDets.length; i++) {
+      const d = clusterDets[i];
+      const changed = d.person_id !== c.id;
+      if (changed) reassignedCount++;
+      const promoteBest = !hasKept && i === 0;
+      await saveDetection({
+        ...d,
+        person_id: c.id,
+        status: promoteBest ? 'kept' : d.status,
+        discard_reason: promoteBest ? null : d.discard_reason,
+      });
+    }
+    await recomputeBrowserPersonStats(c.id);
+  }
+
+  // Clean out obsolete old unnamed person rows
+  const refreshedDets = await getAllStoredDetections();
+  const usedIds = new Set(refreshedDets.map((d) => d.person_id).filter(Boolean));
+  for (const oldP of existingPersons) {
+    if (!usedIds.has(oldP.id)) {
+      await deleteBrowserPerson(oldP.id);
+    }
+  }
+
+  return {
+    persons_before: personsBefore,
+    persons_after: clusters.length,
+    reassigned_count: reassignedCount,
+  };
 }

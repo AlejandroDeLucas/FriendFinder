@@ -412,3 +412,92 @@ def test_one_hour_source_retention_and_pin_guard(isolated_env, monkeypatch: pyte
     assert client.post("/api/auth/verify", json={"pin": "4821"}).status_code == 200
     assert client.get("/api/persons", headers={"X-Access-Pin": "4821"}).status_code == 200
 
+
+def test_recluster_splits_mixed_identities_preserving_names(isolated_env):
+    """Verify complete-linkage recluster separates distinct people mixed into one cluster while preserving custom name."""
+    db = isolated_env["db"]
+    client = isolated_env["client"]
+
+    emb_katy_1 = np.zeros(512, dtype=np.float32)
+    emb_katy_1[0] = 1.0
+    emb_katy_2 = np.zeros(512, dtype=np.float32)
+    emb_katy_2[0] = 0.96
+    emb_katy_2[1] = 0.28
+
+    emb_other_1 = np.zeros(512, dtype=np.float32)
+    emb_other_1[20] = 1.0
+    emb_other_2 = np.zeros(512, dtype=np.float32)
+    emb_other_2[20] = 0.95
+    emb_other_2[21] = 0.31
+
+    media = db.create_media(
+        media_id="mix1",
+        original_filename="party.mp4",
+        media_type="video",
+        file_path="/tmp/party.mp4",
+        file_size=100,
+    )
+    katy = db.create_person("Katy", centroid=emb_katy_1)
+
+    d1 = db.insert_detection(
+        {
+            "media_id": media["id"],
+            "person_id": katy["id"],
+            "portrait_score": 92.0,
+            "frontality_score": 88.0,
+            "overall_score": 92.0,
+            "embedding": emb_katy_1,
+            "status": "kept",
+        }
+    )
+    db.insert_detection(
+        {
+            "media_id": media["id"],
+            "person_id": katy["id"],
+            "portrait_score": 84.0,
+            "frontality_score": 80.0,
+            "overall_score": 84.0,
+            "embedding": emb_katy_2,
+            "status": "kept",
+        }
+    )
+    # Two detections from a completely different woman mistakenly inside Katy
+    db.insert_detection(
+        {
+            "media_id": media["id"],
+            "person_id": katy["id"],
+            "portrait_score": 86.0,
+            "frontality_score": 82.0,
+            "overall_score": 86.0,
+            "embedding": emb_other_1,
+            "status": "kept",
+        }
+    )
+    db.insert_detection(
+        {
+            "media_id": media["id"],
+            "person_id": katy["id"],
+            "portrait_score": 78.0,
+            "frontality_score": 76.0,
+            "overall_score": 78.0,
+            "embedding": emb_other_2,
+            "status": "kept",
+        }
+    )
+    db.update_person_metadata(katy["id"], cover_detection_id=d1["id"])
+
+    resp = client.post("/api/persons/recluster")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["persons_before"] == 1
+    assert data["persons_after"] == 2
+    assert data["reassigned_count"] == 2
+
+    persons = client.get("/api/persons").json()
+    names = {p["name"] for p in persons}
+    assert "Katy" in names
+    assert len(persons) == 2
+    for p in persons:
+        assert p["total_detections"] == 2
+
+

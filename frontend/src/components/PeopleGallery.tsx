@@ -5,6 +5,7 @@ import {
   Edit3,
   GitMerge,
   Image as ImageIcon,
+  RefreshCw,
   Scissors,
   Search,
   Trash2,
@@ -132,6 +133,21 @@ export function PeopleGallery({
     }
   };
 
+  const handleRecluster = async () => {
+    setBusy(true);
+    try {
+      const res = await api.reclusterPersons();
+      onToast(
+        `Reagrupado con alta precisión: ${res.persons_before} → ${res.persons_after} persona(s) (${res.reassigned_count} reasignadas). Nombres guardados conservados.`
+      );
+      onRefresh();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error al reagrupar');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (!loading && persons.length === 0) {
     return (
       <section className="empty-studio">
@@ -211,6 +227,16 @@ export function PeopleGallery({
               <Scissors size={14} /> Recortes PNG
             </button>
           </div>
+
+          <button
+            id="btn-recluster-people"
+            className="btn"
+            disabled={busy || persons.length === 0}
+            onClick={handleRecluster}
+            title="Vuelve a agrupar todas las capturas con máxima precisión sin perder tus nombres guardados"
+          >
+            <RefreshCw size={15} /> Reagrupar
+          </button>
 
           <button
             id="btn-export-all"

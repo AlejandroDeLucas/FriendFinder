@@ -793,3 +793,137 @@ def classify_media_type(filename: str) -> str | None:
     if ext in VIDEO_EXTENSIONS:
         return "video"
     return None
+
+
+def recluster_all_persons(database: Database | None = None) -> dict[str, int]:
+    """Global quality-first complete-linkage 512-D ArcFace re-clustering preserving user-named friends."""
+    import re
+
+    db = database or default_db
+    settings = db.get_settings()
+    base_thresh = float(settings.get("similarity_threshold", "0.45"))
+
+    existing_persons = db.list_persons(include_ignored=False)
+    all_dets = db.get_all_detections_with_embeddings()
+    persons_before = len(existing_persons)
+    if not all_dets:
+        return {"persons_before": persons_before, "persons_after": persons_before, "reassigned_count": 0}
+
+    det_by_id = {d["id"]: d for d in all_dets}
+    clusters: list[dict[str, Any]] = []
+    assigned: set[str] = set()
+
+    def is_custom_name(name: str) -> bool:
+        return not re.match(r"^Persona \d+$", name.strip(), re.IGNORECASE)
+
+    # 1. Anchor every user-named person on their cover (or best portrait) detection
+    for p in existing_persons:
+        if not is_custom_name(p["name"]):
+            continue
+        cover_id = p.get("cover_detection_id")
+        anchor_det = det_by_id.get(cover_id) if cover_id else None
+        if anchor_det is None or anchor_det.get("embedding_vec") is None:
+            mine = [d for d in all_dets if d.get("person_id") == p["id"] and d.get("embedding_vec") is not None]
+            if not mine:
+                continue
+            anchor_det = max(mine, key=lambda d: float(d["portrait_score"]))
+        emb = anchor_det["embedding_vec"]
+        clusters.append(
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "centroid": emb.copy(),
+                "anchors": [emb.copy()],
+                "det_ids": [anchor_det["id"]],
+                "existing": True,
+            }
+        )
+        assigned.add(anchor_det["id"])
+
+    # 2. Sort remaining detections by quality + frontality DESC so crisp shots form pure anchors first
+    remaining = sorted(
+        [d for d in all_dets if d["id"] not in assigned and d.get("embedding_vec") is not None],
+        key=lambda d: float(d["portrait_score"]) + 0.35 * float(d["frontality_score"]),
+        reverse=True,
+    )
+
+    auto_idx = 1
+
+    def next_name() -> str:
+        nonlocal auto_idx
+        used = {c["name"] for c in clusters}
+        while f"Persona {auto_idx}" in used:
+            auto_idx += 1
+        res = f"Persona {auto_idx}"
+        auto_idx += 1
+        return res
+
+    for d in remaining:
+        emb = d["embedding_vec"]
+        is_clean = float(d["portrait_score"]) >= 50.0 and float(d["frontality_score"]) >= 48.0
+        req_sim = base_thresh if is_clean else min(0.8, base_thresh + 0.05)
+
+        best_c = None
+        best_score = -1.0
+        for c in clusters:
+            c_sim = cosine_similarity(emb, c["centroid"])
+            a_sims = [cosine_similarity(emb, a) for a in c["anchors"]]
+            min_a_sim = min(a_sims)
+            avg_a_sim = sum(a_sims) / len(a_sims)
+            # Complete-linkage check: agrees with centroid AND does not contradict top anchors
+            if c_sim >= req_sim and avg_a_sim >= req_sim and min_a_sim >= req_sim - 0.08:
+                score = 0.55 * c_sim + 0.45 * avg_a_sim
+                if score > best_score:
+                    best_score = score
+                    best_c = c
+
+        if best_c is not None:
+            best_c["det_ids"].append(d["id"])
+            if is_clean and len(best_c["anchors"]) < 6:
+                best_c["anchors"].append(emb.copy())
+                mean_vec = np.mean(best_c["anchors"], axis=0)
+                norm = float(np.linalg.norm(mean_vec))
+                best_c["centroid"] = mean_vec / norm if norm > 0 else mean_vec
+        else:
+            created = db.create_person(name=next_name(), centroid=emb)
+            clusters.append(
+                {
+                    "id": created["id"],
+                    "name": created["name"],
+                    "centroid": emb.copy(),
+                    "anchors": [emb.copy()],
+                    "det_ids": [d["id"]],
+                    "existing": False,
+                }
+            )
+
+    reassigned_count = 0
+    active_ids = set()
+    for c in clusters:
+        active_ids.add(c["id"])
+        cluster_dets = sorted(
+            [det_by_id[did] for did in c["det_ids"] if did in det_by_id],
+            key=lambda x: float(x["overall_score"]),
+            reverse=True,
+        )
+        has_kept = any(x["status"] == "kept" for x in cluster_dets)
+        for i, d in enumerate(cluster_dets):
+            if d.get("person_id") != c["id"]:
+                reassigned_count += 1
+            updates: dict[str, Any] = {"person_id": c["id"]}
+            if not has_kept and i == 0:
+                updates["status"] = "kept"
+                updates["discard_reason"] = None
+            db.update_detection(d["id"], **updates)
+        db.recompute_person_stats(c["id"])
+
+    # Remove obsolete empty person records
+    for p in existing_persons:
+        if p["id"] not in active_ids:
+            db.delete_person(p["id"])
+
+    return {
+        "persons_before": persons_before,
+        "persons_after": len(clusters),
+        "reassigned_count": reassigned_count,
+    }
