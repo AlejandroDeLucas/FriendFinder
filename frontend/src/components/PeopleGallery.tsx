@@ -2,6 +2,7 @@ import { useState } from 'react';
 import {
   Check,
   Download,
+  Edit3,
   GitMerge,
   Image as ImageIcon,
   Scissors,
@@ -9,6 +10,7 @@ import {
   Trash2,
   Upload,
   Users,
+  X,
 } from 'lucide-react';
 import { api, assetUrl } from '../api';
 import type { PersonSummary } from '../types';
@@ -33,7 +35,25 @@ export function PeopleGallery({
   const [query, setQuery] = useState('');
   const [previewMode, setPreviewMode] = useState<'portrait' | 'cutout'>('portrait');
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [nameDraft, setNameDraft] = useState('');
   const [busy, setBusy] = useState(false);
+
+  const handleQuickRename = async (personId: string) => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) {
+      setEditingId(null);
+      return;
+    }
+    try {
+      await api.updatePerson(personId, { name: trimmed });
+      setEditingId(null);
+      onToast(`Guardado como "${trimmed}". Se reconocerá automáticamente en futuras fotos y vídeos.`);
+      onRefresh();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error al guardar nombre');
+    }
+  };
 
   const filtered = persons.filter((p) =>
     p.name.toLowerCase().includes(query.trim().toLowerCase())
@@ -346,18 +366,69 @@ export function PeopleGallery({
 
               <div
                 className="person-card-body"
-                style={{ cursor: 'pointer' }}
-                onClick={() => onSelectPerson(person.id)}
+                style={{ cursor: editingId === person.id ? 'default' : 'pointer' }}
+                onClick={() => {
+                  if (editingId !== person.id) onSelectPerson(person.id);
+                }}
               >
-                <div className="person-card-name-row">
-                  <h3 className="person-card-name">{person.name}</h3>
+                {editingId === person.id ? (
+                  <div
+                    style={{ display: 'flex', gap: 5, alignItems: 'center' }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <input
+                      className="input"
+                      style={{ padding: '5px 8px', fontSize: '0.86rem' }}
+                      value={nameDraft}
+                      placeholder="Nombre del amigo..."
+                      autoFocus
+                      onChange={(e) => setNameDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void handleQuickRename(person.id);
+                        if (e.key === 'Escape') setEditingId(null);
+                      }}
+                    />
+                    <button
+                      aria-label="Guardar nombre"
+                      className="btn btn-primary btn-sm"
+                      style={{ padding: '6px 8px' }}
+                      onClick={() => handleQuickRename(person.id)}
+                    >
+                      <Check size={14} />
+                    </button>
+                    <button
+                      aria-label="Cancelar"
+                      className="btn btn-ghost btn-sm"
+                      style={{ padding: '6px 6px' }}
+                      onClick={() => setEditingId(null)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="person-card-name-row">
+                    <h3 className="person-card-name">{person.name}</h3>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      style={{ padding: '3px 7px', fontSize: '0.75rem', flexShrink: 0 }}
+                      title="Guardar con nombre para reconocimiento automático"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditingId(person.id);
+                        setNameDraft(/^Persona \d+$/.test(person.name) ? '' : person.name);
+                      }}
+                    >
+                      <Edit3 size={13} />
+                      {/^Persona \d+$/.test(person.name) ? 'Nombrar' : ''}
+                    </button>
+                  </div>
+                )}
+                <div className="person-meta-row" style={{ alignItems: 'center' }}>
                   <span className="badge badge-success mono">{person.kept_count} mejores</span>
-                </div>
-                <div className="person-meta-row">
                   <span>{person.media_count} archivo(s)</span>
                   {person.discarded_count > 0 && (
                     <span style={{ color: 'var(--ink-muted)' }}>
-                      · {person.discarded_count} descartadas
+                      · {person.discarded_count} desc.
                     </span>
                   )}
                 </div>

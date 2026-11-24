@@ -145,6 +145,13 @@ export interface JobInfo {
     discarded_detections: number;
     new_persons: number;
     media_results: JobSummaryMediaResult[];
+    detected_persons?: Array<{
+      id: string;
+      name: string;
+      is_new: boolean;
+      thumb_path: string | null;
+      captures_in_batch: number;
+    }>;
   } | null;
   created_at: string;
   updated_at: string;

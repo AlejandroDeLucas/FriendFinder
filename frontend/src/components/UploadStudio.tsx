@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import {
+  Check,
   CheckCircle2,
   Clock,
   Film,
@@ -8,10 +9,11 @@ import {
   Pin,
   Sparkles,
   Upload,
+  UserCheck,
   X,
   XCircle,
 } from 'lucide-react';
-import { api, formatBytes } from '../api';
+import { api, assetUrl, formatBytes } from '../api';
 import type { JobInfo } from '../types';
 
 interface Props {
@@ -21,6 +23,7 @@ interface Props {
   retentionMinutes: number;
   onJobStarted: (jobId: string) => void;
   onGoPeople: () => void;
+  onPersonsUpdated: () => void;
   onToast: (msg: string) => void;
 }
 
@@ -31,6 +34,7 @@ export function UploadStudio({
   retentionMinutes,
   onJobStarted,
   onGoPeople,
+  onPersonsUpdated,
   onToast,
 }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -40,6 +44,21 @@ export function UploadStudio({
   // Por defecto false: el archivo subido expira en 1 hora (lo generado se conserva siempre)
   const [keepForever, setKeepForever] = useState<boolean>(false);
   const [uploading, setUploading] = useState(false);
+  const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
+  const [savedNames, setSavedNames] = useState<Record<string, string>>({});
+
+  const handleSavePersonName = async (personId: string, fallbackName: string) => {
+    const nextName = (nameDrafts[personId] ?? fallbackName).trim();
+    if (!nextName) return;
+    try {
+      await api.updatePerson(personId, { name: nextName });
+      setSavedNames((prev) => ({ ...prev, [personId]: nextName }));
+      onToast(`"${nextName}" guardado. Se le asignará este nombre automáticamente en futuras fotos y vídeos.`);
+      onPersonsUpdated();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error guardando nombre');
+    }
+  };
 
   const retentionLabel =
     retentionMinutes === 60
@@ -308,6 +327,119 @@ export function UploadStudio({
               <Layers size={15} /> Ver personas extraídas
             </button>
           </div>
+
+          {lastFinishedJob.summary.detected_persons &&
+            lastFinishedJob.summary.detected_persons.length > 0 && (
+              <div style={{ marginBottom: 18 }}>
+                <div
+                  style={{
+                    fontSize: '0.84rem',
+                    fontWeight: 700,
+                    color: 'var(--ink-secondary)',
+                    marginBottom: 10,
+                  }}
+                >
+                  Personas detectadas (ponles nombre y se reconocerán solas en futuras fotos/vídeos):
+                </div>
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))',
+                    gap: 10,
+                  }}
+                >
+                  {lastFinishedJob.summary.detected_persons.map((dp) => {
+                    const currentName = savedNames[dp.id] || dp.name;
+                    const isDefault = /^Persona \d+$/.test(currentName);
+                    const draftVal =
+                      nameDrafts[dp.id] !== undefined
+                        ? nameDrafts[dp.id]
+                        : isDefault
+                          ? ''
+                          : currentName;
+                    const thumbSrc =
+                      assetUrl.portrait(dp.thumb_path) || assetUrl.thumb(dp.thumb_path);
+
+                    return (
+                      <div
+                        key={dp.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          padding: 10,
+                          borderRadius: 'var(--radius-md)',
+                          background: 'var(--bg-canvas)',
+                          border: '1px solid var(--border-hairline)',
+                        }}
+                      >
+                        {thumbSrc ? (
+                          <img
+                            src={thumbSrc}
+                            alt={currentName}
+                            style={{
+                              width: 48,
+                              height: 48,
+                              borderRadius: 10,
+                              objectFit: 'cover',
+                              flexShrink: 0,
+                            }}
+                          />
+                        ) : (
+                          <div
+                            style={{
+                              width: 48,
+                              height: 48,
+                              borderRadius: 10,
+                              background: 'var(--bg-subtle)',
+                              display: 'grid',
+                              placeItems: 'center',
+                              flexShrink: 0,
+                            }}
+                          >
+                            <UserCheck size={20} />
+                          </div>
+                        )}
+                        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 5 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                            <span
+                              className={`badge ${dp.is_new ? 'badge-accent' : 'badge-success'}`}
+                              style={{ fontSize: '0.7rem' }}
+                            >
+                              {dp.is_new ? 'Nueva persona' : `✓ Reconocido: ${currentName}`}
+                            </span>
+                          </div>
+                          <div style={{ display: 'flex', gap: 5 }}>
+                            <input
+                              className="input"
+                              style={{ padding: '5px 8px', fontSize: '0.83rem' }}
+                              placeholder="Ej. Carlos, Lucía..."
+                              value={draftVal}
+                              onChange={(e) =>
+                                setNameDrafts((prev) => ({ ...prev, [dp.id]: e.target.value }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  void handleSavePersonName(dp.id, currentName);
+                                }
+                              }}
+                            />
+                            <button
+                              className="btn btn-primary btn-sm"
+                              style={{ padding: '5px 9px' }}
+                              onClick={() => handleSavePersonName(dp.id, currentName)}
+                              title="Guardar nombre"
+                            >
+                              <Check size={14} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
           <div className="result-list">
             {lastFinishedJob.summary.media_results.map((item) => {

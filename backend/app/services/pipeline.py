@@ -435,6 +435,7 @@ def process_media_batch_sync(
     in_memory_centroids: dict[str, tuple[str, np.ndarray, int]] = {}
     for pid, name, emb in db.get_all_person_embeddings():
         in_memory_centroids[pid] = (name, emb, 3)
+    preexisting_person_ids = set(in_memory_centroids.keys())
 
     affected_persons: set[str] = set()
     stats: dict[str, Any] = {
@@ -655,10 +656,24 @@ def process_media_batch_sync(
             )
 
         # Recompute final centroids & best portrait/body pointers for all affected persons
-        for pid in affected_persons:
+        detected_persons = []
+        for pid in sorted(affected_persons):
             db.recompute_person_stats(pid)
+            p = db.get_person_summary(pid)
+            if p:
+                cover = p.get("cover_detection") or p.get("best_portrait") or {}
+                detected_persons.append(
+                    {
+                        "id": p["id"],
+                        "name": p["name"],
+                        "is_new": pid not in preexisting_person_ids,
+                        "thumb_path": cover.get("portrait_path") or cover.get("thumb_path"),
+                        "captures_in_batch": p.get("total_detections", 1),
+                    }
+                )
 
         stats["affected_person_ids"] = sorted(affected_persons)
+        stats["detected_persons"] = detected_persons
         db.update_job(
             job_id,
             status="done",

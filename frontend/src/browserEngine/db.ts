@@ -151,9 +151,27 @@ export async function ensureBlobsHydrated(): Promise<void> {
   }
 }
 
-export async function saveBlob(key: string, blob: Blob): Promise<string> {
-  await idbPut('blobs', { key, blob });
+export function registerSessionBlobUrl(key: string, blob: Blob): string {
   return registerBlobUrl(key, blob);
+}
+
+export async function saveBlob(
+  key: string,
+  blob: Blob,
+  options?: { maxPersistBytes?: number }
+): Promise<{ url: string; persisted: boolean }> {
+  const url = registerBlobUrl(key, blob);
+  const limit = options?.maxPersistBytes ?? Infinity;
+  if (blob.size > limit) {
+    return { url, persisted: false };
+  }
+  try {
+    await idbPut('blobs', { key, blob });
+    return { url, persisted: true };
+  } catch {
+    // Mobile Safari / Chrome IndexedDB quota exceeded: keep working in-memory for this session
+    return { url, persisted: false };
+  }
 }
 
 export async function loadBlob(key: string): Promise<Blob | null> {

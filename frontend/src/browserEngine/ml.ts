@@ -646,6 +646,154 @@ export async function extractThumbBlobBrowser(
   return canvasToBlob(c, 'image/jpeg', 0.82);
 }
 
+/** Sample a Float32 mask with smooth bilinear interpolation (eliminates jagged/blocky edges). */
+function sampleMaskBilinear(
+  mask: Float32Array,
+  mw: number,
+  mh: number,
+  u: number,
+  v: number
+): number {
+  const x = Math.max(0, Math.min(mw - 1, u * (mw - 1)));
+  const y = Math.max(0, Math.min(mh - 1, v * (mh - 1)));
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const x1 = Math.min(mw - 1, x0 + 1);
+  const y1 = Math.min(mh - 1, y0 + 1);
+  const fx = x - x0;
+  const fy = y - y0;
+
+  const v00 = mask[y0 * mw + x0];
+  const v10 = mask[y0 * mw + x1];
+  const v01 = mask[y1 * mw + x0];
+  const v11 = mask[y1 * mw + x1];
+
+  return (
+    v00 * (1 - fx) * (1 - fy) +
+    v10 * fx * (1 - fy) +
+    v01 * (1 - fx) * fy +
+    v11 * fx * fy
+  );
+}
+
+/** Distance from point (x, y) to a vertical spine segment representing a person's head-to-torso axis. */
+function distToPersonSpine(
+  x: number,
+  y: number,
+  bbox: [number, number, number, number]
+): number {
+  const cx = 0.5 * (bbox[0] + bbox[2]);
+  const bw = Math.max(20, bbox[2] - bbox[0]);
+  const yTop = bbox[1] + 0.1 * (bbox[3] - bbox[1]);
+  const yBot = bbox[3] - 0.1 * (bbox[3] - bbox[1]);
+  const clampedY = Math.max(yTop, Math.min(yBot, y));
+  // Normalize horizontal distance by person width so narrow/wide people compete fairly
+  const dx = (x - cx) / (0.65 * bw);
+  const dy = (y - clampedY) / Math.max(40, bbox[3] - bbox[1]);
+  return Math.hypot(dx, dy);
+}
+
+/** Keep only foreground pixels connected to this person's face/chest seed so strangers' limbs vanish organically. */
+function keepConnectedToSeed(
+  alpha: Uint8Array,
+  w: number,
+  h: number,
+  seedX: number,
+  seedY: number
+): Uint8Array {
+  const visited = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  let head = 0;
+  let tail = 0;
+
+  const sx = Math.max(0, Math.min(w - 1, Math.round(seedX)));
+  const sy = Math.max(0, Math.min(h - 1, Math.round(seedY)));
+
+  // Seed a small disk around face/upper-chest center so BFS always catches the person's mask
+  const r = Math.max(6, Math.round(Math.min(w, h) * 0.04));
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const nx = sx + dx;
+      const ny = sy + dy;
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const idx = ny * w + nx;
+      if (!visited[idx] && alpha[idx] > 35) {
+        visited[idx] = 1;
+        queue[tail++] = idx;
+      }
+    }
+  }
+
+  if (tail === 0) return alpha; // fallback if seed missed
+
+  while (head < tail) {
+    const idx = queue[head++];
+    const x = idx % w;
+    const y = (idx - x) / w;
+
+    if (x > 0) {
+      const n = idx - 1;
+      if (!visited[n] && alpha[n] > 28) {
+        visited[n] = 1;
+        queue[tail++] = n;
+      }
+    }
+    if (x + 1 < w) {
+      const n = idx + 1;
+      if (!visited[n] && alpha[n] > 28) {
+        visited[n] = 1;
+        queue[tail++] = n;
+      }
+    }
+    if (y > 0) {
+      const n = idx - w;
+      if (!visited[n] && alpha[n] > 28) {
+        visited[n] = 1;
+        queue[tail++] = n;
+      }
+    }
+    if (y + 1 < h) {
+      const n = idx + w;
+      if (!visited[n] && alpha[n] > 28) {
+        visited[n] = 1;
+        queue[tail++] = n;
+      }
+    }
+  }
+
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = visited[i] ? alpha[i] : 0;
+  }
+  return out;
+}
+
+/** Smooth 3x3 Gaussian-like alpha feathering for natural, non-jagged organic silhouette edges. */
+function featherAlpha(alpha: Uint8Array, w: number, h: number): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const yUp = Math.max(0, y - 1) * w;
+    const yMid = y * w;
+    const yDn = Math.min(h - 1, y + 1) * w;
+    for (let x = 0; x < w; x++) {
+      const xL = Math.max(0, x - 1);
+      const xR = Math.min(w - 1, x + 1);
+      const val =
+        alpha[yUp + xL] +
+        2 * alpha[yUp + x] +
+        alpha[yUp + xR] +
+        2 * alpha[yMid + xL] +
+        4 * alpha[yMid + x] +
+        2 * alpha[yMid + xR] +
+        alpha[yDn + xL] +
+        2 * alpha[yDn + x] +
+        alpha[yDn + xR];
+      out[yMid + x] = Math.round(val / 16);
+    }
+  }
+  return out;
+}
+
 export async function extractAllAssetBlobsBrowser(
   source: HTMLCanvasElement,
   faceBbox: [number, number, number, number],
@@ -668,68 +816,133 @@ export async function extractAllAssetBlobsBrowser(
   const portraitCanvas = cropCanvas(source, px1, py1, px2, py2);
   const thumbCanvas = cropCanvas(source, px1, py1, px2, py2, 360);
 
+  // Generous working region around the person so arms, hair, and shoulders are NEVER clipped square
   let cx1 = px1;
   let cy1 = py1;
   let cx2 = px2;
   let cy2 = py2;
   if (matchedBody) {
     const [bx1, by1, bx2, by2] = matchedBody.bbox;
-    const padX = 0.06 * (bx2 - bx1);
-    const padY = 0.04 * (by2 - by1);
+    const padX = 0.14 * (bx2 - bx1);
+    const padYTop = 0.1 * (by2 - by1);
+    const padYBot = 0.08 * (by2 - by1);
     cx1 = Math.max(0, bx1 - padX);
-    cy1 = Math.max(0, by1 - padY);
+    cy1 = Math.max(0, by1 - padYTop);
     cx2 = Math.min(w, bx2 + padX);
-    cy2 = Math.min(h, by2 + padY);
+    cy2 = Math.min(h, by2 + padYBot);
+  } else {
+    // Expand downward to capture upper body/shoulders even if object detector didn't catch body box
+    const fw = Math.max(1, faceBbox[2] - faceBbox[0]);
+    const fh = Math.max(1, faceBbox[3] - faceBbox[1]);
+    const fcx = 0.5 * (faceBbox[0] + faceBbox[2]);
+    cx1 = Math.max(0, fcx - 1.7 * fw);
+    cy1 = Math.max(0, faceBbox[1] - 0.9 * fh);
+    cx2 = Math.min(w, fcx + 1.7 * fw);
+    cy2 = Math.min(h, faceBbox[3] + 3.0 * fh);
   }
   const cropCanvasEl = cropCanvas(source, cx1, cy1, cx2, cy2);
 
-  // Transparent PNG Cutout removing background + OTHER people
+  // Organic Transparent PNG Cutout (bilinear mask + soft Voronoi separation + connected component + feathering)
   let cutoutBlob: Blob | null = null;
   if (personMask && maskW > 0 && maskH > 0) {
-    const cutCanvas = cropCanvas(source, cx1, cy1, cx2, cy2);
-    const cutCtx = cutCanvas.getContext('2d')!;
-    const imgData = cutCtx.getImageData(0, 0, cutCanvas.width, cutCanvas.height);
+    const workCanvas = cropCanvas(source, cx1, cy1, cx2, cy2);
+    const cw = workCanvas.width;
+    const ch = workCanvas.height;
+    const workCtx = workCanvas.getContext('2d')!;
+    const imgData = workCtx.getImageData(0, 0, cw, ch);
     const data = imgData.data;
 
+    // Auto-check mask polarity at the person's face center so mask is never inverted
+    const fcx = 0.5 * (faceBbox[0] + faceBbox[2]);
+    const fcy = 0.5 * (faceBbox[1] + faceBbox[3]);
+    const faceMaskVal = sampleMaskBilinear(personMask, maskW, maskH, fcx / w, fcy / h);
+    const invertMask = faceMaskVal < 0.35;
+
+    const targetBox: [number, number, number, number] = matchedBody
+      ? matchedBody.bbox
+      : [cx1, cy1, cx2, cy2];
     const otherBoxes = allBodies
       .filter((b) => b !== matchedBody)
       .map((b) => b.bbox);
 
     const sx0 = Math.floor(cx1);
     const sy0 = Math.floor(cy1);
-    let fgPixels = 0;
+    const rawAlpha = new Uint8Array(cw * ch);
 
-    for (let y = 0; y < cutCanvas.height; y++) {
+    for (let y = 0; y < ch; y++) {
       const gy = sy0 + y;
-      const my = Math.min(maskH - 1, Math.max(0, Math.floor((gy / h) * maskH)));
-      for (let x = 0; x < cutCanvas.width; x++) {
+      const v = gy / Math.max(1, h);
+      for (let x = 0; x < cw; x++) {
         const gx = sx0 + x;
-        const mx = Math.min(maskW - 1, Math.max(0, Math.floor((gx / w) * maskW)));
-        let conf = personMask[my * maskW + mx];
+        const u = gx / Math.max(1, w);
+        let conf = sampleMaskBilinear(personMask, maskW, maskH, u, v);
+        if (invertMask) conf = 1 - conf;
 
-        // Suppress pixels strictly inside OTHER people's boxes (outside our own face box)
-        const inOwnFace =
-          gx >= faceBbox[0] && gx <= faceBbox[2] && gy >= faceBbox[1] && gy <= faceBbox[3];
-        if (!inOwnFace && otherBoxes.length > 0) {
+        // Smooth organic separation from other people via spine distance (no hard rectangular cuts!)
+        if (otherBoxes.length > 0) {
+          const dMine = distToPersonSpine(gx, gy, targetBox);
+          let dOtherMin = Infinity;
           for (const ob of otherBoxes) {
-            if (gx >= ob[0] && gx <= ob[2] && gy >= ob[1] && gy <= ob[3]) {
-              conf = 0;
-              break;
-            }
+            const d = distToPersonSpine(gx, gy, ob);
+            if (d < dOtherMin) dOtherMin = d;
+          }
+          // Soft sigmoid ownership weight: 1.0 near our spine, fades smoothly to 0 near other person's spine
+          const marginDiff = dOtherMin - dMine;
+          if (marginDiff < 0.25) {
+            const ownership = Math.max(0, Math.min(1, (marginDiff + 0.18) / 0.43));
+            conf *= ownership;
           }
         }
 
-        // Smooth alpha curve for clean edges
-        const alpha = conf > 0.65 ? 255 : conf < 0.25 ? 0 : Math.round(((conf - 0.25) / 0.4) * 255);
-        const pIdx = (y * cutCanvas.width + x) * 4 + 3;
-        data[pIdx] = alpha;
-        if (alpha > 40) fgPixels++;
+        // Smooth alpha curve (gentle organic contour)
+        const a =
+          conf >= 0.62
+            ? 255
+            : conf <= 0.24
+              ? 0
+              : Math.round(((conf - 0.24) / 0.38) * 255);
+        rawAlpha[y * cw + x] = a;
       }
     }
 
-    if (fgPixels > 120) {
-      cutCtx.putImageData(imgData, 0, 0);
-      cutoutBlob = await canvasToBlob(cutCanvas, 'image/png');
+    // Keep only silhouette connected to this person's face/torso + soft edge feathering
+    const connected = keepConnectedToSeed(rawAlpha, cw, ch, fcx - sx0, fcy - sy0);
+    const smoothAlpha = featherAlpha(connected, cw, ch);
+
+    // Find tight organic bounding box of non-transparent pixels
+    let minX = cw;
+    let minY = ch;
+    let maxX = 0;
+    let maxY = 0;
+    let fgPixels = 0;
+
+    for (let y = 0; y < ch; y++) {
+      for (let x = 0; x < cw; x++) {
+        const a = smoothAlpha[y * cw + x];
+        data[(y * cw + x) * 4 + 3] = a;
+        if (a > 24) {
+          fgPixels++;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+
+    if (fgPixels > 160 && maxX > minX + 12 && maxY > minY + 12) {
+      workCtx.putImageData(imgData, 0, 0);
+      const pad = 16;
+      const tx = Math.max(0, minX - pad);
+      const ty = Math.max(0, minY - pad);
+      const tw = Math.min(cw - tx, maxX - minX + 1 + pad * 2);
+      const th = Math.min(ch - ty, maxY - minY + 1 + pad * 2);
+
+      const finalCut = document.createElement('canvas');
+      finalCut.width = tw;
+      finalCut.height = th;
+      finalCut.getContext('2d')!.drawImage(workCanvas, tx, ty, tw, th, 0, 0, tw, th);
+      cutoutBlob = await canvasToBlob(finalCut, 'image/png');
     }
   }
 

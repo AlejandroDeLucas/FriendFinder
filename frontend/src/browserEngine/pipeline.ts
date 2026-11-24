@@ -35,6 +35,7 @@ import {
   buildBrowserSceneSummary,
   descriptorSimilarity,
   detectFacesOnlyBrowser,
+  euclideanDistance,
   extractAllAssetBlobsBrowser,
   extractThumbBlobBrowser,
   scoreDetectionBrowser,
@@ -49,13 +50,26 @@ function uid(): string {
 }
 
 function classifyFile(file: File): 'image' | 'video' | null {
-  if (file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp|bmp|gif|avif|heic)$/i.test(file.name)) {
+  if (
+    file.type.startsWith('image/') ||
+    /\.(jpg|jpeg|png|webp|bmp|gif|avif|heic|heif)$/i.test(file.name)
+  ) {
     return 'image';
   }
-  if (file.type.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm|m4v)$/i.test(file.name)) {
+  if (
+    file.type.startsWith('video/') ||
+    /\.(mp4|mov|avi|mkv|webm|m4v|3gp|3gpp|mpeg|mpg|ogv|ts)$/i.test(file.name)
+  ) {
     return 'video';
   }
   return null;
+}
+
+interface PersonMatchEntry {
+  name: string;
+  vec: number[];
+  exemplars: number[][];
+  count: number;
 }
 
 function loadImageToCanvas(blob: Blob, maxDim = 1600): Promise<HTMLCanvasElement> {
@@ -100,28 +114,40 @@ async function makeMediaThumb(canvas: HTMLCanvasElement, mediaId: string): Promi
 async function matchOrCreateBrowserPerson(
   embedding: number[],
   threshold: number,
-  centroids: Map<string, { name: string; vec: number[]; count: number }>
+  centroids: Map<string, PersonMatchEntry>
 ): Promise<{ personId: string; personName: string; isNew: boolean }> {
-  // Convert user's similarity threshold (default 0.45) to face-api 128-D similarity (~0.50 -> dist <= 0.57)
-  const effectiveThreshold = Math.max(0.46, Math.min(0.75, threshold + 0.05));
+  // Calibrated dlib 128-D Euclidean distance threshold (~0.60 at default threshold=0.45)
+  // Higher user threshold = stricter (smaller maxDist); lower = more permissive
+  const maxDist = Math.max(0.42, Math.min(0.72, 0.61 - (threshold - 0.45) * 0.5));
   let bestId: string | null = null;
   let bestName = '';
-  let bestSim = -1;
+  let bestDist = Infinity;
 
   for (const [pid, info] of centroids.entries()) {
-    const sim = descriptorSimilarity(embedding, info.vec);
-    if (sim > bestSim) {
-      bestSim = sim;
+    let dist = euclideanDistance(embedding, info.vec);
+    for (const ex of info.exemplars) {
+      const d = euclideanDistance(embedding, ex);
+      if (d < dist) dist = d;
+    }
+    if (dist < bestDist) {
+      bestDist = dist;
       bestId = pid;
       bestName = info.name;
     }
   }
 
-  if (bestId && bestSim >= effectiveThreshold) {
+  if (bestId && bestDist <= maxDist) {
     const cur = centroids.get(bestId)!;
     const nextCount = cur.count + 1;
     const nextVec = cur.vec.map((v, i) => (v * cur.count + embedding[i]) / nextCount);
-    centroids.set(bestId, { name: cur.name, vec: nextVec, count: nextCount });
+    const nextExemplars =
+      cur.exemplars.length < 8 ? [...cur.exemplars, [...embedding]] : cur.exemplars;
+    centroids.set(bestId, {
+      name: cur.name,
+      vec: nextVec,
+      exemplars: nextExemplars,
+      count: nextCount,
+    });
     return { personId: bestId, personName: bestName, isNew: false };
   }
 
@@ -141,7 +167,12 @@ async function matchOrCreateBrowserPerson(
     updated_at: now,
   };
   await savePerson(person);
-  centroids.set(person.id, { name: newName, vec: [...embedding], count: 1 });
+  centroids.set(person.id, {
+    name: newName,
+    vec: [...embedding],
+    exemplars: [[...embedding]],
+    count: 1,
+  });
   return { personId: person.id, personName: newName, isNew: true };
 }
 
@@ -268,8 +299,9 @@ async function processFrameCanvas(
   timestampSec: number,
   frameIdx: number,
   settings: AppSettings,
-  centroids: Map<string, { name: string; vec: number[]; count: number }>,
+  centroids: Map<string, PersonMatchEntry>,
   affectedPersons: Set<string>,
+  batchPersonTracker: Map<string, { isNew: boolean; count: number }>,
   onStatus?: (msg: string) => void
 ): Promise<{ total: number; kept: number; discarded: number; newPersons: number }> {
   const analysis = await analyzeFrameBrowser(canvas, onStatus);
@@ -307,6 +339,11 @@ async function processFrameCanvas(
     );
     affectedPersons.add(personId);
     if (isNew) newPersons++;
+    const prevTrack = batchPersonTracker.get(personId);
+    batchPersonTracker.set(personId, {
+      isNew: prevTrack ? prevTrack.isNew : isNew,
+      count: (prevTrack?.count ?? 0) + 1,
+    });
 
     const decision = await evaluateKeepOrDiscardBrowser(
       personId,
@@ -453,23 +490,35 @@ async function processFrameCanvas(
   return { total: sortedFaces.length, kept: keptCount, discarded: discardedCount, newPersons };
 }
 
-function seekVideoTo(video: HTMLVideoElement, sec: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const onSeeked = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = () => {
-      cleanup();
-      reject(new Error('Error leyendo frame de vídeo'));
-    };
-    const cleanup = () => {
+function seekVideoTo(video: HTMLVideoElement, sec: number, timeoutMs = 4500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const target = Math.min(Math.max(0, sec), Math.max(0, (video.duration || 0) - 0.05));
+    if (Math.abs(video.currentTime - target) < 0.02 && video.readyState >= 2) {
+      resolve(true);
+      return;
+    }
+
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
       video.removeEventListener('seeked', onSeeked);
       video.removeEventListener('error', onError);
+      // Let mobile hardware video decoder paint frame before canvas drawImage
+      window.requestAnimationFrame(() => resolve(ok));
     };
+    const onSeeked = () => finish(true);
+    const onError = () => finish(false);
+    const timer = window.setTimeout(() => finish(video.readyState >= 2), timeoutMs);
+
     video.addEventListener('seeked', onSeeked);
     video.addEventListener('error', onError);
-    video.currentTime = Math.min(Math.max(0, sec), Math.max(0, (video.duration || 0) - 0.05));
+    try {
+      video.currentTime = target;
+    } catch {
+      finish(false);
+    }
   });
 }
 
@@ -478,8 +527,9 @@ async function processVideoInBrowser(
   media: StoredMedia,
   sampleFps: number,
   settings: AppSettings,
-  centroids: Map<string, { name: string; vec: number[]; count: number }>,
+  centroids: Map<string, PersonMatchEntry>,
   affectedPersons: Set<string>,
+  batchPersonTracker: Map<string, { isNew: boolean; count: number }>,
   onProgress: (frac: number, step: string) => void
 ): Promise<{
   width: number;
@@ -496,43 +546,104 @@ async function processVideoInBrowser(
   const video = document.createElement('video');
   video.muted = true;
   video.playsInline = true;
+  video.setAttribute('playsinline', 'true');
+  video.setAttribute('webkit-playsinline', 'true');
   video.preload = 'auto';
-  video.src = url;
-
-  await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error('No se pudo abrir el vídeo en este navegador'));
-  });
-
-  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
-  const scale = Math.min(1, 1280 / Math.max(1, video.videoWidth || 640, video.videoHeight || 480));
-  const w = Math.max(1, Math.round((video.videoWidth || 640) * scale));
-  const h = Math.max(1, Math.round((video.videoHeight || 480) * scale));
-
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d')!;
-
-  const stepSec = 1 / Math.max(0.2, sampleFps);
-  const timestamps: number[] = [];
-  for (let t = 0; t < duration; t += stepSec) {
-    timestamps.push(t);
-    if (timestamps.length >= 180) break; // guard mobile memory on huge videos
-  }
-  if (timestamps.length === 0) timestamps.push(0);
+  // Mounting invisibly in DOM is required on iOS Safari so hardware decoding renders video frames
+  video.style.position = 'fixed';
+  video.style.left = '-9999px';
+  video.style.top = '0';
+  video.style.width = '2px';
+  video.style.height = '2px';
+  video.style.opacity = '0.001';
+  video.style.pointerEvents = 'none';
+  document.body.appendChild(video);
 
   let thumbKey: string | null = null;
   let total = 0;
   let kept = 0;
   let discarded = 0;
   let newPersons = 0;
+  let analyzedCount = 0;
+  let duration = 1;
+  let w = 640;
+  let h = 480;
 
   try {
+    video.src = url;
+    video.load();
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(
+        () => reject(new Error('El navegador tardó demasiado en abrir este vídeo (prueba MP4/H.264)')),
+        15000
+      );
+      const done = () => {
+        window.clearTimeout(timer);
+        video.removeEventListener('loadeddata', done);
+        video.removeEventListener('loadedmetadata', onMeta);
+        video.removeEventListener('error', onErr);
+        resolve();
+      };
+      const onMeta = () => {
+        if (video.readyState >= 2) done();
+      };
+      const onErr = () => {
+        window.clearTimeout(timer);
+        reject(
+          new Error(
+            'Tu navegador no pudo decodificar este formato de vídeo. En móvil prueba con MP4/MOV estándar o usa el servidor Python.'
+          )
+        );
+      };
+      video.addEventListener('loadeddata', done);
+      video.addEventListener('loadedmetadata', onMeta);
+      video.addEventListener('error', onErr);
+    });
+
+    // Warm up iOS Safari hardware video decoder briefly (muted)
+    try {
+      const playPromise = video.play();
+      if (playPromise) {
+        await playPromise.catch(() => undefined);
+      }
+      video.pause();
+    } catch {
+      // ignore autoplay restrictions
+    }
+
+    duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
+    const rawW = video.videoWidth || 640;
+    const rawH = video.videoHeight || 480;
+    // Cap video analysis canvas at 960px for fast, smooth mobile decoding even on 1:30+ 4K videos
+    const scale = Math.min(1, 960 / Math.max(1, rawW, rawH));
+    w = Math.max(1, Math.round(rawW * scale));
+    h = Math.max(1, Math.round(rawH * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d')!;
+
+    // Compute sampling timestamps (cap at 180 frames so long videos stay snappy on mobile)
+    let stepSec = 1 / Math.max(0.2, sampleFps);
+    const maxFrames = 180;
+    if (duration / stepSec > maxFrames) {
+      stepSec = duration / maxFrames;
+    }
+    const timestamps: number[] = [];
+    for (let t = 0.05; t < duration; t += stepSec) {
+      timestamps.push(t);
+    }
+    if (timestamps.length === 0) timestamps.push(0);
+
     for (let i = 0; i < timestamps.length; i++) {
       const ts = timestamps[i];
-      await seekVideoTo(video, ts);
+      const ok = await seekVideoTo(video, ts);
+      if (!ok) continue;
+
       ctx.drawImage(video, 0, 0, w, h);
+      analyzedCount++;
       if (!thumbKey) {
         thumbKey = await makeMediaThumb(canvas, media.id);
       }
@@ -545,6 +656,7 @@ async function processVideoInBrowser(
         settings,
         centroids,
         affectedPersons,
+        batchPersonTracker,
         (s) => onProgress(i / timestamps.length, s)
       );
       total += res.total;
@@ -556,22 +668,29 @@ async function processVideoInBrowser(
         (i + 1) / timestamps.length,
         `${media.original_filename}: ${ts.toFixed(1)}s / ${duration.toFixed(1)}s (${kept} mejores)`
       );
+
+      // Yield briefly to keep mobile UI smooth and prevent browser watchdog kills
+      await new Promise((r) => window.setTimeout(r, 15));
     }
+
+    return {
+      width: rawW,
+      height: rawH,
+      durationSec: Math.round(duration * 100) / 100,
+      thumbKey,
+      framesAnalyzed: analyzedCount,
+      total,
+      kept,
+      discarded,
+      newPersons,
+    };
   } finally {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    video.remove();
     URL.revokeObjectURL(url);
   }
-
-  return {
-    width: video.videoWidth || w,
-    height: video.videoHeight || h,
-    durationSec: Math.round(duration * 100) / 100,
-    thumbKey,
-    framesAnalyzed: timestamps.length,
-    total,
-    kept,
-    discarded,
-    newPersons,
-  };
 }
 
 export async function uploadMediaBrowser(
@@ -600,7 +719,9 @@ export async function uploadMediaBrowser(
     }
     const mediaId = uid();
     const uploadKey = `upload_${mediaId}`;
-    await saveBlob(uploadKey, file);
+    // Avoid blowing mobile IndexedDB storage quota on huge 100-400MB phone videos:
+    // keep playable in current session and only persist raw upload blob in IDB if <= 45 MB
+    const saved = await saveBlob(uploadKey, file, { maxPersistBytes: 45 * 1024 * 1024 });
 
     const now = new Date();
     const media: StoredMedia = {
@@ -608,7 +729,7 @@ export async function uploadMediaBrowser(
       original_filename: file.name,
       media_type: mediaType,
       file_path: uploadKey,
-      upload_blob_key: uploadKey,
+      upload_blob_key: saved.persisted ? uploadKey : null,
       thumb_path: null,
       file_size: file.size,
       width: 0,
@@ -667,15 +788,35 @@ export async function uploadMediaBrowser(
     try {
       updateJob({ status: 'running', current_step: 'Cargando modelos IA en tu dispositivo...' });
 
-      const existingPersons = await getAllStoredPersons();
-      const centroids = new Map<string, { name: string; vec: number[]; count: number }>();
+      // Seed centroids AND top 6 saved exemplars per existing person for reliable automatic recognition
+      const [existingPersons, existingDets] = await Promise.all([
+        getAllStoredPersons(),
+        getAllStoredDetections(),
+      ]);
+      const exemplarsByPerson = new Map<string, number[][]>();
+      for (const d of [...existingDets].sort((a, b) => b.portrait_score - a.portrait_score)) {
+        if (!d.person_id || !Array.isArray(d.embedding) || d.embedding.length === 0) continue;
+        const arr = exemplarsByPerson.get(d.person_id) || [];
+        if (arr.length < 6) {
+          arr.push(d.embedding);
+          exemplarsByPerson.set(d.person_id, arr);
+        }
+      }
+
+      const centroids = new Map<string, PersonMatchEntry>();
       for (const p of existingPersons) {
         if (Array.isArray(p.centroid) && p.centroid.length > 0) {
-          centroids.set(p.id, { name: p.name, vec: [...p.centroid], count: 3 });
+          centroids.set(p.id, {
+            name: p.name,
+            vec: [...p.centroid],
+            exemplars: exemplarsByPerson.get(p.id) || [[...p.centroid]],
+            count: Math.max(3, (exemplarsByPerson.get(p.id) || []).length),
+          });
         }
       }
 
       const affectedPersons = new Set<string>();
+      const batchPersonTracker = new Map<string, { isNew: boolean; count: number }>();
       const mediaResults: JobSummaryMediaResult[] = [];
       let usefulMedia = 0;
       let discardedMedia = 0;
@@ -718,6 +859,7 @@ export async function uploadMediaBrowser(
             settings,
             centroids,
             affectedPersons,
+            batchPersonTracker,
             (step) => updateJob({ current_step: step })
           );
           total = res.total;
@@ -733,6 +875,7 @@ export async function uploadMediaBrowser(
             settings,
             centroids,
             affectedPersons,
+            batchPersonTracker,
             (frac, step) => updateJob({ progress: baseFrac + span * frac, current_step: step })
           );
           width = vres.width;
@@ -797,6 +940,28 @@ export async function uploadMediaBrowser(
         await recomputeBrowserPersonStats(pid);
       }
 
+      // Build detected_persons list so user can name new friends or see auto-recognized names immediately
+      const latestSummaries = await listBrowserPersons();
+      const summaryMap = new Map(latestSummaries.map((p) => [p.id, p]));
+      const detectedPersons = Array.from(batchPersonTracker.entries())
+        .map(([pid, info]) => {
+          const p = summaryMap.get(pid);
+          if (!p) return null;
+          return {
+            id: p.id,
+            name: p.name,
+            is_new: info.isNew,
+            thumb_path:
+              p.cover_detection?.portrait_path ||
+              p.cover_detection?.thumb_path ||
+              p.best_portrait?.portrait_path ||
+              p.best_portrait?.thumb_path ||
+              null,
+            captures_in_batch: info.count,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+
       updateJob({
         status: 'done',
         progress: 1,
@@ -813,6 +978,7 @@ export async function uploadMediaBrowser(
           discarded_detections: discardedDetections,
           new_persons: newPersonsTotal,
           media_results: mediaResults,
+          detected_persons: detectedPersons,
         },
       });
     } catch (err) {

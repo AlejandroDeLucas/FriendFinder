@@ -378,6 +378,7 @@ export function App() {
             retentionMinutes={Number(settings?.source_retention_minutes || '60')}
             onJobStarted={(jobId) => setActiveJobId(jobId)}
             onGoPeople={() => navigateTab('people')}
+            onPersonsUpdated={refreshAll}
             onToast={showToast}
           />
         ) : tab === 'search' ? (
