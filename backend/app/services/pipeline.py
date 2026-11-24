@@ -816,29 +816,43 @@ def recluster_all_persons(database: Database | None = None) -> dict[str, int]:
     def is_custom_name(name: str) -> bool:
         return not re.match(r"^Persona \d+$", name.strip(), re.IGNORECASE)
 
-    # 1. Anchor every user-named person on their cover (or best portrait) detection
+    # 1. Anchor every user-named person (and any photo-less saved identity with a centroid)
+    centroid_by_pid = {pid: emb for pid, _n, emb in db.get_all_person_embeddings()}
     for p in existing_persons:
-        if not is_custom_name(p["name"]):
+        mine = [d for d in all_dets if d.get("person_id") == p["id"] and d.get("embedding_vec") is not None]
+        is_photoless_saved = len(mine) == 0 and p["id"] in centroid_by_pid
+        if not is_custom_name(p["name"]) and not is_photoless_saved:
             continue
         cover_id = p.get("cover_detection_id")
         anchor_det = det_by_id.get(cover_id) if cover_id else None
         if anchor_det is None or anchor_det.get("embedding_vec") is None:
-            mine = [d for d in all_dets if d.get("person_id") == p["id"] and d.get("embedding_vec") is not None]
-            if not mine:
-                continue
-            anchor_det = max(mine, key=lambda d: float(d["portrait_score"]))
-        emb = anchor_det["embedding_vec"]
-        clusters.append(
-            {
-                "id": p["id"],
-                "name": p["name"],
-                "centroid": emb.copy(),
-                "anchors": [emb.copy()],
-                "det_ids": [anchor_det["id"]],
-                "existing": True,
-            }
-        )
-        assigned.add(anchor_det["id"])
+            anchor_det = max(mine, key=lambda d: float(d["portrait_score"])) if mine else None
+
+        if anchor_det is not None and anchor_det.get("embedding_vec") is not None:
+            emb = anchor_det["embedding_vec"]
+            clusters.append(
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "centroid": emb.copy(),
+                    "anchors": [emb.copy()],
+                    "det_ids": [anchor_det["id"]],
+                    "existing": True,
+                }
+            )
+            assigned.add(anchor_det["id"])
+        elif p["id"] in centroid_by_pid:
+            emb = centroid_by_pid[p["id"]]
+            clusters.append(
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "centroid": emb.copy(),
+                    "anchors": [emb.copy()],
+                    "det_ids": [],
+                    "existing": True,
+                }
+            )
 
     # 2. Sort remaining detections by quality + frontality DESC so crisp shots form pure anchors first
     remaining = sorted(

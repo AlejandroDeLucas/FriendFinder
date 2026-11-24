@@ -341,12 +341,33 @@ export function PeopleGallery({
                     style={{
                       width: '100%',
                       height: '100%',
-                      display: 'grid',
-                      placeItems: 'center',
-                      color: 'var(--ink-muted)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 8,
+                      background: 'var(--bg-darkroom)',
+                      color: 'var(--ink-inverse)',
                     }}
                   >
-                    <Users size={34} />
+                    <span
+                      style={{
+                        fontFamily: 'var(--font-serif)',
+                        fontSize: '2.4rem',
+                        fontWeight: 600,
+                        letterSpacing: '-0.03em',
+                      }}
+                    >
+                      {person.name
+                        .split(/\s+/)
+                        .map((w) => w[0] || '')
+                        .join('')
+                        .slice(0, 2)
+                        .toUpperCase() || '?'}
+                    </span>
+                    <span className="badge badge-dark" style={{ fontSize: '0.72rem' }}>
+                      Solo identidad (sin fotos)
+                    </span>
                   </div>
                 )}
 

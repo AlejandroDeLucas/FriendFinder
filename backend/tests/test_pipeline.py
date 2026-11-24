@@ -501,3 +501,66 @@ def test_recluster_splits_mixed_identities_preserving_names(isolated_env):
         assert p["total_detections"] == 2
 
 
+def test_clear_person_photos_preserves_identity_and_recognition(isolated_env):
+    """Verify clearing all photos of a person removes images but keeps their profile & centroid alive for future matching."""
+    from app.services.pipeline import match_or_create_person
+
+    db = isolated_env["db"]
+    dirs = isolated_env["dirs"]
+    client = isolated_env["client"]
+
+    emb = np.zeros(512, dtype=np.float32)
+    emb[5] = 1.0
+
+    portrait_file = dirs["PORTRAITS_DIR"] / "carlos_p1.jpg"
+    portrait_file.write_bytes(b"portrait-bytes")
+
+    media = db.create_media(
+        media_id="m_carlos",
+        original_filename="carlos.jpg",
+        media_type="image",
+        file_path="/tmp/carlos.jpg",
+        file_size=100,
+    )
+    carlos = db.create_person("Carlos", centroid=emb)
+    db.insert_detection(
+        {
+            "media_id": media["id"],
+            "person_id": carlos["id"],
+            "portrait_score": 90.0,
+            "overall_score": 90.0,
+            "portrait_path": portrait_file.name,
+            "embedding": emb,
+            "status": "kept",
+        }
+    )
+
+    # Clear all photos while preserving Carlos
+    res = client.post(f"/api/persons/{carlos['id']}/clear-photos")
+    assert res.status_code == 200
+    assert res.json() == {"cleared_detections": 1, "person_preserved": True}
+    assert not portrait_file.exists()
+
+    # Carlos remains in gallery with 0 photos and centroid intact
+    detail = client.get(f"/api/persons/{carlos['id']}").json()
+    assert detail["name"] == "Carlos"
+    assert detail["total_detections"] == 0
+    assert detail["cover_detection"] is None
+
+    # Survives recluster even with 0 photos
+    recluster = client.post("/api/persons/recluster")
+    assert recluster.status_code == 200
+    assert any(p["id"] == carlos["id"] and p["name"] == "Carlos" for p in client.get("/api/persons").json())
+
+    # Future photo of Carlos matches his preserved centroid automatically!
+    centroids = {pid: (name, vec, 3) for pid, name, vec in db.get_all_person_embeddings()}
+    emb_future = np.zeros(512, dtype=np.float32)
+    emb_future[5] = 0.98
+    emb_future[6] = 0.19
+    matched_id, matched_name, is_new = match_or_create_person(db, emb_future, 0.45, centroids)
+    assert not is_new
+    assert matched_id == carlos["id"]
+    assert matched_name == "Carlos"
+
+
+

@@ -1,4 +1,5 @@
 import {
+  clearBrowserPersonPhotos,
   deleteBrowserMedia,
   deleteBrowserPerson,
   deleteStoredDetection,
@@ -333,6 +334,14 @@ export const api = {
     const mode = await initEngineMode();
     if (mode === 'browser') return deleteBrowserPerson(personId);
     return request<{ deleted: boolean }>(`/api/persons/${personId}`, { method: 'DELETE' });
+  },
+
+  clearPersonPhotos: async (
+    personId: string
+  ): Promise<{ cleared_detections: number; person_preserved: boolean }> => {
+    const mode = await initEngineMode();
+    if (mode === 'browser') return clearBrowserPersonPhotos(personId);
+    return request(`/api/persons/${personId}/clear-photos`, { method: 'POST' });
   },
 
   reclusterPersons: async (): Promise<{

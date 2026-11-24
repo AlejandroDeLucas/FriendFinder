@@ -52,7 +52,7 @@ export function MediaLibrary({
   const handleDeleteSource = async (item: MediaItem, keepAssets: boolean) => {
     const msg = keepAssets
       ? `¿Borrar el archivo original "${item.original_filename}" ahora?\n\nLas imágenes y recortes PNG de tus amigos ya extraídos SE CONSERVARÁN.`
-      : `¿Eliminar "${item.original_filename}" y TODAS las detecciones asociadas?`;
+      : `¿Eliminar "${item.original_filename}" y sus fotos extraídas?\n\nLos perfiles de las personas y su reconocimiento facial SE CONSERVARÁN para futuras fotos y vídeos.`;
     if (!window.confirm(msg)) return;
     try {
       const res = await api.deleteMedia(item.id, keepAssets);

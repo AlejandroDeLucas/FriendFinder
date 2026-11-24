@@ -7,6 +7,7 @@ import {
   Eye,
   Film,
   Image as ImageIcon,
+  ImageOff,
   Layers,
   Play,
   RotateCcw,
@@ -140,15 +141,47 @@ export function PersonDetail({
   };
 
   const handleDeleteDetection = async (det: Detection) => {
-    if (!window.confirm('¿Eliminar esta captura borrosa o incorrecta?')) return;
+    if (
+      !window.confirm(
+        `¿Eliminar esta captura?\n\nEl perfil y el reconocimiento facial de "${person?.name || 'esta persona'}" se conservarán.`
+      )
+    ) {
+      return;
+    }
     setBusyAction(true);
     try {
       await api.deleteDetection(det.id);
-      onToast('Captura eliminada');
+      onToast(
+        `Captura eliminada. La identidad de "${person?.name || 'esta persona'}" se sigue conservando.`
+      );
       onPersonChanged();
       await loadPerson();
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error eliminando captura');
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleClearPhotos = async () => {
+    if (!person) return;
+    if (
+      !window.confirm(
+        `¿Borrar TODAS las fotos y recortes de "${person.name}"?\n\nSu perfil y su firma facial SE CONSERVARÁN para reconocerle automáticamente en futuras fotos y vídeos.`
+      )
+    ) {
+      return;
+    }
+    setBusyAction(true);
+    try {
+      const res = await api.clearPersonPhotos(person.id);
+      onToast(
+        `${res.cleared_detections} foto(s) borrada(s). El perfil de "${person.name}" se conserva para reconocerle en futuras subidas.`
+      );
+      onPersonChanged();
+      await loadPerson();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error borrando fotos');
     } finally {
       setBusyAction(false);
     }
@@ -372,11 +405,43 @@ export function PersonDetail({
             <Download size={15} /> Exportar Pack Videojuego
           </button>
 
-          <button className="btn btn-danger btn-icon" onClick={handleDeletePerson} title="Eliminar persona">
+          {person.total_detections > 0 && (
+            <button
+              id="btn-clear-person-photos"
+              className="btn"
+              disabled={busyAction}
+              onClick={handleClearPhotos}
+              title="Borra las fotos y recortes pero conserva la identidad facial para futuras fotos y vídeos"
+            >
+              <ImageOff size={15} /> Borrar fotos (conservar persona)
+            </button>
+          )}
+
+          <button className="btn btn-danger btn-icon" onClick={handleDeletePerson} title="Eliminar persona por completo">
             <Trash2 size={15} />
           </button>
         </div>
       </header>
+
+      {person.total_detections === 0 && (
+        <div
+          className="panel"
+          style={{
+            marginBottom: 20,
+            background: 'var(--success-soft)',
+            borderColor: 'hsla(150, 42%, 31%, 0.24)',
+          }}
+        >
+          <strong style={{ color: 'var(--success)' }}>
+            Identidad guardada sin fotos (0 imágenes almacenadas)
+          </strong>
+          <p style={{ margin: '6px 0 0', fontSize: '0.88rem', color: 'var(--ink-primary)' }}>
+            El reconocimiento facial de <strong>{person.name}</strong> sigue activo. Aunque hayas
+            borrado sus fotos, cuando vuelva a aparecer en una foto o vídeo futuro se le asignará
+            automáticamente el nombre <strong>{person.name}</strong>.
+          </p>
+        </div>
+      )}
 
       {showExportPanel && (
         <div className="panel" style={{ marginBottom: 20 }}>

@@ -834,11 +834,19 @@ export async function uploadMediaBrowser(
       const centroids = new Map<string, PersonMatchEntry>();
       for (const p of existingPersons) {
         if (Array.isArray(p.centroid) && p.centroid.length > 0) {
+          const detExemplars = exemplarsByPerson.get(p.id) || [];
+          const savedRefs = Array.isArray(p.reference_embeddings) ? p.reference_embeddings : [];
+          const exemplars =
+            detExemplars.length > 0
+              ? detExemplars
+              : savedRefs.length > 0
+                ? savedRefs
+                : [[...p.centroid]];
           centroids.set(p.id, {
             name: p.name,
             vec: [...p.centroid],
-            exemplars: exemplarsByPerson.get(p.id) || [[...p.centroid]],
-            count: Math.max(3, (exemplarsByPerson.get(p.id) || []).length),
+            exemplars,
+            count: Math.max(3, exemplars.length),
           });
         }
       }
@@ -1450,29 +1458,45 @@ export async function reclusterAllBrowserPersons(): Promise<{
   const clusters: Cluster[] = [];
   const assignedDetIds = new Set<string>();
 
-  // 1. Seed user-named persons on their cover (or sharpest frontal) detection so names are preserved cleanly
+  // 1. Seed user-named persons (and any saved photo-less identity with a centroid) so they are ALWAYS preserved
   const isCustomName = (n: string) => !/^Persona \d+$/i.test(n.trim());
   for (const p of existingPersons) {
-    if (!isCustomName(p.name)) continue;
+    const mine = allDets.filter((d) => d.person_id === p.id && Array.isArray(d.embedding));
+    const isPhotoLessSaved = mine.length === 0 && Array.isArray(p.centroid) && p.centroid.length > 0;
+    if (!isCustomName(p.name) && !isPhotoLessSaved) continue;
+
     const coverDet = p.cover_detection_id ? detById.get(p.cover_detection_id) : undefined;
     const bestDet =
       coverDet && Array.isArray(coverDet.embedding)
         ? coverDet
-        : allDets
-            .filter((d) => d.person_id === p.id && Array.isArray(d.embedding))
-            .sort((a, b) => b.portrait_score - a.portrait_score)[0];
-    if (!bestDet || !bestDet.embedding) continue;
+        : mine.sort((a, b) => b.portrait_score - a.portrait_score)[0];
 
-    clusters.push({
-      id: p.id,
-      name: p.name,
-      notes: p.notes || '',
-      isNamed: true,
-      centroid: [...bestDet.embedding],
-      anchors: [[...bestDet.embedding]],
-      detIds: [bestDet.id],
-    });
-    assignedDetIds.add(bestDet.id);
+    if (bestDet && bestDet.embedding) {
+      clusters.push({
+        id: p.id,
+        name: p.name,
+        notes: p.notes || '',
+        isNamed: true,
+        centroid: [...bestDet.embedding],
+        anchors: [[...bestDet.embedding]],
+        detIds: [bestDet.id],
+      });
+      assignedDetIds.add(bestDet.id);
+    } else if (Array.isArray(p.centroid) && p.centroid.length > 0) {
+      const savedRefs =
+        Array.isArray(p.reference_embeddings) && p.reference_embeddings.length > 0
+          ? p.reference_embeddings.map((v) => [...v])
+          : [[...p.centroid]];
+      clusters.push({
+        id: p.id,
+        name: p.name,
+        notes: p.notes || '',
+        isNamed: true,
+        centroid: [...p.centroid],
+        anchors: savedRefs,
+        detIds: [],
+      });
+    }
   }
 
   // 2. Sort remaining detections by quality + frontality DESC so crisp frontal faces build pure clusters first
@@ -1593,9 +1617,10 @@ export async function reclusterAllBrowserPersons(): Promise<{
     await recomputeBrowserPersonStats(c.id);
   }
 
-  // Clean out obsolete old unnamed person rows
+  // Clean out only truly obsolete unnamed person rows (NEVER delete preserved photo-less clusters)
   const refreshedDets = await getAllStoredDetections();
-  const usedIds = new Set(refreshedDets.map((d) => d.person_id).filter(Boolean));
+  const usedIds = new Set<string>(refreshedDets.map((d) => d.person_id).filter(Boolean) as string[]);
+  for (const c of clusters) usedIds.add(c.id);
   for (const oldP of existingPersons) {
     if (!usedIds.has(oldP.id)) {
       await deleteBrowserPerson(oldP.id);

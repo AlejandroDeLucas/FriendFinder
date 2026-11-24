@@ -121,6 +121,15 @@ def delete_person(person_id: str) -> dict[str, Any]:
     return {"deleted": True, "person_id": person_id}
 
 
+@router.post("/{person_id}/clear-photos")
+def clear_person_photos(person_id: str) -> dict[str, Any]:
+    """Delete all saved photos of a person while preserving their profile & facial recognition centroid."""
+    existing = db.get_person_summary(person_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Persona no encontrada")
+    return db.clear_person_photos(person_id)
+
+
 @router.post("/{person_id}/analyze-scene")
 def analyze_person_scenes(
     person_id: str,

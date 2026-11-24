@@ -503,6 +503,15 @@ class Database:
                 (person_id,),
             ).fetchall()
             if not dets:
+                # Preserve existing centroid so the person is still recognized in future photos/videos!
+                conn.execute(
+                    """
+                    UPDATE persons
+                    SET best_portrait_id = NULL, best_body_id = NULL, cover_detection_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_now_iso(), person_id),
+                )
                 return
 
             # Compute weighted centroid from highest quality detections (up to top 20)
@@ -543,6 +552,43 @@ class Database:
                 """,
                 (centroid_blob, best_portrait, best_body, cover_id, utc_now_iso(), person_id),
             )
+
+    def clear_person_photos(self, person_id: str) -> dict[str, Any]:
+        """Delete all saved photos/detections of a person while preserving their profile & facial identity centroid."""
+        from . import config as cfg
+
+        # Ensure centroid is up to date before removing detections
+        self.recompute_person_stats(person_id)
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT id, portrait_path, cutout_path, crop_path, thumb_path FROM detections WHERE person_id = ?",
+                (person_id,),
+            ).fetchall()
+            for r in rows:
+                for directory, col in (
+                    (cfg.PORTRAITS_DIR, "portrait_path"),
+                    (cfg.CUTOUTS_DIR, "cutout_path"),
+                    (cfg.CROPS_DIR, "crop_path"),
+                    (cfg.THUMBS_DIR, "thumb_path"),
+                ):
+                    fname = r[col]
+                    if fname:
+                        fp = directory / fname
+                        if fp.exists():
+                            try:
+                                fp.unlink()
+                            except OSError:
+                                pass
+            conn.execute("DELETE FROM detections WHERE person_id = ?", (person_id,))
+            conn.execute(
+                """
+                UPDATE persons
+                SET best_portrait_id = NULL, best_body_id = NULL, cover_detection_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now_iso(), person_id),
+            )
+            return {"cleared_detections": len(rows), "person_preserved": True}
 
     def merge_persons(self, target_person_id: str, source_person_ids: list[str]) -> dict[str, Any] | None:
         source_ids = [sid for sid in source_person_ids if sid != target_person_id]

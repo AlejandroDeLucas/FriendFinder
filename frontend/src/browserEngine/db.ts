@@ -15,6 +15,7 @@ export interface StoredPerson {
   name: string;
   notes: string;
   centroid: number[] | null;
+  reference_embeddings?: number[][];
   cover_detection_id: string | null;
   best_portrait_id: string | null;
   best_body_id: string | null;
@@ -396,11 +397,24 @@ export async function recomputeBrowserPersonStats(personId: string): Promise<voi
     .filter((d) => d.person_id === personId)
     .sort((a, b) => b.overall_score - a.overall_score);
 
-  if (allDets.length === 0) return;
+  if (allDets.length === 0) {
+    // Preserve person's saved centroid & reference_embeddings even with 0 photos!
+    await savePerson({
+      ...person,
+      cover_detection_id: null,
+      best_portrait_id: null,
+      best_body_id: null,
+      updated_at: new Date().toISOString(),
+    });
+    return;
+  }
 
-  // Weighted average centroid from top 20 detections
-  const top = allDets.slice(0, 20).filter((d) => Array.isArray(d.embedding) && d.embedding.length > 0);
+  // Weighted average centroid + top 6 reference embeddings preserved on the person record
+  const top = allDets
+    .slice(0, 20)
+    .filter((d) => Array.isArray(d.embedding) && d.embedding.length > 0);
   let centroid = person.centroid;
+  let refEmbeddings = person.reference_embeddings || [];
   if (top.length > 0) {
     const dim = top[0].embedding!.length;
     const sum = new Array<number>(dim).fill(0);
@@ -415,6 +429,10 @@ export async function recomputeBrowserPersonStats(personId: string): Promise<voi
     if (wTotal > 0) {
       centroid = sum.map((v) => v / wTotal);
     }
+    refEmbeddings = top
+      .sort((a, b) => b.portrait_score - a.portrait_score)
+      .slice(0, 6)
+      .map((d) => [...d.embedding!]);
   }
 
   const kept = allDets.filter((d) => d.status === 'kept');
@@ -438,11 +456,42 @@ export async function recomputeBrowserPersonStats(personId: string): Promise<voi
   await savePerson({
     ...person,
     centroid,
+    reference_embeddings: refEmbeddings,
     best_portrait_id: bestPortrait,
     best_body_id: bestBody,
     cover_detection_id: coverId,
     updated_at: new Date().toISOString(),
   });
+}
+
+export async function clearBrowserPersonPhotos(
+  personId: string
+): Promise<{ cleared_detections: number; person_preserved: boolean }> {
+  const person = await getStoredPerson(personId);
+  if (!person) throw new Error('Persona no encontrada');
+
+  // Snapshot centroid & reference embeddings BEFORE deleting any photos so recognition stays 100% intact
+  await recomputeBrowserPersonStats(personId);
+  const refreshedPerson = (await getStoredPerson(personId)) || person;
+
+  const allDets = await getAllStoredDetections();
+  const mine = allDets.filter((d) => d.person_id === personId);
+  for (const d of mine) {
+    for (const key of [d.portrait_path, d.cutout_path, d.crop_path, d.thumb_path]) {
+      if (key) await deleteBlob(key);
+    }
+    await idbDelete('detections', d.id);
+  }
+
+  await savePerson({
+    ...refreshedPerson,
+    cover_detection_id: null,
+    best_portrait_id: null,
+    best_body_id: null,
+    updated_at: new Date().toISOString(),
+  });
+
+  return { cleared_detections: mine.length, person_preserved: true };
 }
 
 function stripEmbedding(d: StoredDetection, mediaMap: Map<string, StoredMedia>): Detection {
