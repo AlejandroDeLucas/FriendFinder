@@ -1146,3 +1146,90 @@ export async function extractAllAssetBlobsBrowser(
 
   return { frameBlob, portraitBlob, cropBlob, thumbBlob, cutoutBlob };
 }
+
+/**
+ * Standalone background removal for any extracted video frame or photo using MediaPipe selfie_multiclass.
+ * Returns a transparent PNG Blob with smooth 3x3 feathered edges.
+ */
+export async function removeBackgroundFromBlob(blob: Blob): Promise<Blob> {
+  await ensureMediaPipe();
+  if (!segmenterInstance) {
+    throw new Error('No se pudo cargar el modelo de recorte sin fondo en este navegador.');
+  }
+
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('No se pudo cargar la imagen del frame.'));
+      el.src = url;
+    });
+
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0, w, h);
+
+    const segRes = segmenterInstance.segment(canvas);
+    const masks = segRes.confidenceMasks;
+    if (!masks || masks.length === 0) {
+      segRes.close?.();
+      throw new Error('No se detectó ninguna persona clara para recortar del fondo.');
+    }
+
+    let personMask: Float32Array;
+    let maskW: number;
+    let maskH: number;
+    if (segmenterIsMulticlass && masks.length >= 2) {
+      const bgMask = masks[0];
+      maskW = bgMask.width;
+      maskH = bgMask.height;
+      const bgArr = bgMask.getAsFloat32Array();
+      personMask = new Float32Array(bgArr.length);
+      for (let i = 0; i < bgArr.length; i++) {
+        personMask[i] = Math.max(0, Math.min(1, 1 - bgArr[i]));
+      }
+    } else {
+      const maskObj = masks.length > 1 ? masks[1] : masks[0];
+      maskW = maskObj.width;
+      maskH = maskObj.height;
+      personMask = new Float32Array(maskObj.getAsFloat32Array());
+    }
+    segRes.close?.();
+
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const data = imgData.data;
+    const rawAlpha = new Uint8Array(w * h);
+    let fgPixels = 0;
+
+    for (let y = 0; y < h; y++) {
+      const v = y / Math.max(1, h);
+      for (let x = 0; x < w; x++) {
+        const u = x / Math.max(1, w);
+        const conf = sampleMaskBilinear(personMask, maskW, maskH, u, v);
+        const a =
+          conf >= 0.62 ? 255 : conf <= 0.24 ? 0 : Math.round(((conf - 0.24) / 0.38) * 255);
+        rawAlpha[y * w + x] = a;
+        if (a > 24) fgPixels++;
+      }
+    }
+
+    if (fgPixels < 150) {
+      throw new Error('No se detectó ninguna persona clara en este frame para quitar el fondo.');
+    }
+
+    const smoothAlpha = featherAlpha(rawAlpha, w, h);
+    for (let i = 0; i < w * h; i++) {
+      data[i * 4 + 3] = smoothAlpha[i];
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return await canvasToBlob(canvas, 'image/png');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+

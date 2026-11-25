@@ -62,3 +62,14 @@ def get_stats() -> dict[str, Any]:
         "active_jobs": active_jobs,
         "device": model_manager.device_info,
     }
+
+
+@router.get("/backup/export")
+def export_backup() -> dict[str, Any]:
+    return db.export_backup()
+
+
+@router.post("/backup/import")
+def import_backup(payload: dict[str, Any]) -> dict[str, int]:
+    return db.import_backup(payload)
+

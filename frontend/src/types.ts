@@ -37,6 +37,7 @@ export interface PersonSummary {
   id: string;
   name: string;
   notes: string;
+  tags?: string[];
   cover_detection_id: string | null;
   best_portrait_id: string | null;
   best_body_id: string | null;

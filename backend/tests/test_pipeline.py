@@ -675,3 +675,44 @@ def test_recluster_unites_same_person_and_enforces_cannot_link(isolated_env):
     counts = sorted(p["total_detections"] for p in client.get("/api/persons").json())
     assert counts == [1, 2]
 
+
+def test_person_tags_and_backup_export_import(isolated_env):
+    """Verify person tags persist cleanly and backup export/import restores names, tags, and centroids."""
+    db = isolated_env["db"]
+    client = isolated_env["client"]
+
+    emb = np.zeros(512, dtype=np.float32)
+    emb[42] = 1.0
+    p = db.create_person("Sofía", centroid=emb)
+
+    patch_res = client.patch(
+        f"/api/persons/{p['id']}",
+        json={"tags": ["Familia", "Juego", "Familia"]},
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["tags"] == ["Familia", "Juego"]
+
+    export_res = client.get("/api/backup/export")
+    assert export_res.status_code == 200
+    backup = export_res.json()
+    assert backup["app"] == "FriendFinder"
+    assert len(backup["persons"]) == 1
+    assert backup["persons"][0]["name"] == "Sofía"
+    assert backup["persons"][0]["tags"] == ["Familia", "Juego"]
+    assert len(backup["persons"][0]["centroid"]) == 512
+
+    # Delete Sofía, then restore from backup JSON!
+    client.delete(f"/api/persons/{p['id']}")
+    assert client.get("/api/persons").json() == []
+
+    import_res = client.post("/api/backup/import", json=backup)
+    assert import_res.status_code == 200
+    assert import_res.json()["imported_persons"] == 1
+
+    restored = client.get("/api/persons").json()
+    assert len(restored) == 1
+    assert restored[0]["name"] == "Sofía"
+    assert restored[0]["tags"] == ["Familia", "Juego"]
+    embs = {pid: vec for pid, _name, vec in db.get_all_person_embeddings()}
+    assert restored[0]["id"] in embs
+    assert embs[restored[0]["id"]][42] > 0.99

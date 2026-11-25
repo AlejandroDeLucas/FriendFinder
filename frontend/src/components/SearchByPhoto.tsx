@@ -5,12 +5,20 @@ import { extractImagesFromPasteEvent, readImagesFromClipboardApi } from '../clip
 import type { SearchResult } from '../types';
 
 interface Props {
+  initialFile?: File | null;
+  onConsumedInitialFile?: () => void;
   onSelectPerson: (personId: string) => void;
   onOpenMediaAt: (mediaId: string, timestampSec: number) => void;
   onToast: (msg: string) => void;
 }
 
-export function SearchByPhoto({ onSelectPerson, onOpenMediaAt, onToast }: Props) {
+export function SearchByPhoto({
+  initialFile,
+  onConsumedInitialFile,
+  onSelectPerson,
+  onOpenMediaAt,
+  onToast,
+}: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [queryFile, setQueryFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string>('');
@@ -44,6 +52,12 @@ export function SearchByPhoto({ onSelectPerson, onOpenMediaAt, onToast }: Props)
     },
     [runSearch, threshold]
   );
+
+  useEffect(() => {
+    if (!initialFile) return;
+    handleFilePick(initialFile);
+    onConsumedInitialFile?.();
+  }, [initialFile, handleFilePick, onConsumedInitialFile]);
 
   // Global Ctrl+V / Cmd+V paste while on Search tab
   useEffect(() => {

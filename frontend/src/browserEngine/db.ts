@@ -14,6 +14,7 @@ export interface StoredPerson {
   id: string;
   name: string;
   notes: string;
+  tags?: string[];
   centroid: number[] | null;
   reference_embeddings?: number[][];
   cover_detection_id: string | null;
@@ -524,6 +525,7 @@ function hydratePersonSummary(
     id: p.id,
     name: p.name,
     notes: p.notes,
+    tags: Array.isArray(p.tags) ? p.tags : [],
     cover_detection_id: p.cover_detection_id,
     best_portrait_id: p.best_portrait_id,
     best_body_id: p.best_body_id,
@@ -624,14 +626,25 @@ export async function getBrowserPersonDetail(personId: string): Promise<PersonDe
 
 export async function updateBrowserPerson(
   personId: string,
-  payload: { name?: string; notes?: string; cover_detection_id?: string; is_ignored?: boolean }
+  payload: {
+    name?: string;
+    notes?: string;
+    tags?: string[];
+    cover_detection_id?: string;
+    is_ignored?: boolean;
+  }
 ): Promise<PersonSummary> {
   const existing = await getStoredPerson(personId);
   if (!existing) throw new Error('Persona no encontrada');
+  const cleanTags =
+    payload.tags !== undefined
+      ? Array.from(new Set(payload.tags.map((t) => t.trim()).filter(Boolean))).slice(0, 16)
+      : existing.tags || [];
   await savePerson({
     ...existing,
     name: payload.name !== undefined ? payload.name.trim() : existing.name,
     notes: payload.notes !== undefined ? payload.notes : existing.notes,
+    tags: cleanTags,
     cover_detection_id:
       payload.cover_detection_id !== undefined
         ? payload.cover_detection_id
@@ -759,3 +772,102 @@ export async function deleteBrowserPerson(personId: string): Promise<{ deleted: 
   await idbDelete('persons', personId);
   return { deleted: true };
 }
+
+export async function exportBrowserBackup(): Promise<Record<string, unknown>> {
+  const [persons, settings] = await Promise.all([getAllStoredPersons(), getBrowserSettings()]);
+  const cleanPersons = persons
+    .filter((p) => !p.is_ignored)
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      notes: p.notes || '',
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      centroid: p.centroid,
+      reference_embeddings: p.reference_embeddings || [],
+      created_at: p.created_at,
+      updated_at: p.updated_at,
+    }));
+
+  return {
+    app: 'FriendFinder',
+    version: 1,
+    engine: 'browser',
+    exported_at: new Date().toISOString(),
+    settings,
+    persons: cleanPersons,
+  };
+}
+
+export async function importBrowserBackup(
+  payload: Record<string, unknown>
+): Promise<{ imported_persons: number; updated_persons: number }> {
+  let importedPersons = 0;
+  let updatedPersons = 0;
+
+  if (payload.settings && typeof payload.settings === 'object') {
+    await updateBrowserSettings(payload.settings as Record<string, unknown>);
+  }
+
+  const incoming = Array.isArray(payload.persons) ? payload.persons : [];
+  const now = new Date().toISOString();
+
+  for (const raw of incoming) {
+    if (!raw || typeof raw !== 'object') continue;
+    const item = raw as Record<string, unknown>;
+    const name = typeof item.name === 'string' ? item.name.trim() : '';
+    if (!name) continue;
+
+    const pid =
+      typeof item.id === 'string' && item.id.trim()
+        ? item.id.trim()
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.slice(0, 12);
+    const notes = typeof item.notes === 'string' ? item.notes : '';
+    const tags = Array.isArray(item.tags)
+      ? Array.from(new Set(item.tags.map((t) => String(t).trim()).filter(Boolean))).slice(0, 16)
+      : [];
+    const centroid =
+      Array.isArray(item.centroid) && item.centroid.length > 0
+        ? (item.centroid as number[])
+        : null;
+    const refEmbeddings = Array.isArray(item.reference_embeddings)
+      ? (item.reference_embeddings as number[][]).filter((v) => Array.isArray(v) && v.length > 0)
+      : undefined;
+
+    const existing = await getStoredPerson(pid);
+    if (existing) {
+      await savePerson({
+        ...existing,
+        name,
+        notes,
+        tags: Array.from(new Set([...(existing.tags || []), ...tags])).slice(0, 16),
+        centroid: centroid || existing.centroid,
+        reference_embeddings:
+          refEmbeddings && refEmbeddings.length > 0
+            ? refEmbeddings
+            : existing.reference_embeddings,
+        is_ignored: 0,
+        updated_at: now,
+      });
+      updatedPersons++;
+    } else {
+      await savePerson({
+        id: pid,
+        name,
+        notes,
+        tags,
+        centroid,
+        reference_embeddings: refEmbeddings,
+        cover_detection_id: null,
+        best_portrait_id: null,
+        best_body_id: null,
+        is_ignored: 0,
+        created_at: typeof item.created_at === 'string' ? item.created_at : now,
+        updated_at: now,
+      });
+      importedPersons++;
+    }
+  }
+
+  return { imported_persons: importedPersons, updated_persons: updatedPersons };
+}
+

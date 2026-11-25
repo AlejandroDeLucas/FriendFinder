@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class PersonUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     notes: str | None = Field(default=None, max_length=1000)
+    tags: list[str] | None = None
     is_ignored: bool | None = None
     cover_detection_id: str | None = None
 

@@ -171,6 +171,13 @@ class Database:
             if "expires_at" not in existing_cols:
                 conn.execute("ALTER TABLE media ADD COLUMN expires_at TEXT")
 
+            person_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(persons)").fetchall()
+            }
+            if "tags" not in person_cols:
+                conn.execute("ALTER TABLE persons ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -467,6 +474,7 @@ class Database:
         *,
         name: str | None = None,
         notes: str | None = None,
+        tags: list[str] | None = None,
         is_ignored: bool | None = None,
         cover_detection_id: str | None = None,
     ) -> dict[str, Any] | None:
@@ -478,6 +486,10 @@ class Database:
         if notes is not None:
             fields.append("notes = ?")
             values.append(notes)
+        if tags is not None:
+            clean_tags = list(dict.fromkeys(t.strip() for t in tags if t and t.strip()))[:16]
+            fields.append("tags = ?")
+            values.append(json.dumps(clean_tags, ensure_ascii=False))
         if is_ignored is not None:
             fields.append("is_ignored = ?")
             values.append(1 if is_ignored else 0)
@@ -668,6 +680,15 @@ class Database:
 
     def _hydrate_person_summary(self, conn: sqlite3.Connection, person: dict[str, Any]) -> dict[str, Any]:
         person.pop("centroid", None)
+        raw_tags = person.get("tags")
+        if isinstance(raw_tags, str):
+            try:
+                parsed = json.loads(raw_tags)
+                person["tags"] = [str(t) for t in parsed] if isinstance(parsed, list) else []
+            except (json.JSONDecodeError, TypeError):
+                person["tags"] = []
+        elif not isinstance(raw_tags, list):
+            person["tags"] = []
         pid = person["id"]
         stats = conn.execute(
             """
@@ -706,6 +727,95 @@ class Database:
             else:
                 person[key] = None
         return person
+
+    def export_backup(self) -> dict[str, Any]:
+        """Export all person identities (names, notes, tags, facial centroids) and settings as portable JSON."""
+        with self.connection() as conn:
+            rows = conn.execute("SELECT * FROM persons WHERE is_ignored = 0").fetchall()
+            persons_out = []
+            for r in rows:
+                emb = decode_embedding(r["centroid"])
+                raw_tags = r["tags"] if "tags" in r.keys() else "[]"
+                try:
+                    tags = json.loads(raw_tags) if isinstance(raw_tags, str) else []
+                except (json.JSONDecodeError, TypeError):
+                    tags = []
+                persons_out.append(
+                    {
+                        "id": r["id"],
+                        "name": r["name"],
+                        "notes": r["notes"] or "",
+                        "tags": tags if isinstance(tags, list) else [],
+                        "centroid": emb.tolist() if emb is not None else None,
+                        "created_at": r["created_at"],
+                        "updated_at": r["updated_at"],
+                    }
+                )
+        return {
+            "app": "FriendFinder",
+            "version": 1,
+            "engine": "server",
+            "exported_at": utc_now_iso(),
+            "settings": self.get_settings(),
+            "persons": persons_out,
+        }
+
+    def import_backup(self, payload: dict[str, Any]) -> dict[str, int]:
+        """Merge imported person identities (names, tags, notes, facial centroids) and settings."""
+        imported_persons = 0
+        updated_persons = 0
+        if isinstance(payload.get("settings"), dict):
+            self.update_settings(payload["settings"])
+
+        persons_in = payload.get("persons") or []
+        if not isinstance(persons_in, list):
+            persons_in = []
+
+        now = utc_now_iso()
+        with self.connection() as conn:
+            for item in persons_in:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                pid = str(item.get("id") or uuid.uuid4().hex[:12])
+                name = str(item["name"]).strip()
+                notes = str(item.get("notes") or "")
+                raw_tags = item.get("tags") or []
+                clean_tags = list(dict.fromkeys(str(t).strip() for t in raw_tags if str(t).strip()))[:16]
+                centroid_list = item.get("centroid")
+                centroid_blob = None
+                if isinstance(centroid_list, list) and len(centroid_list) == 512:
+                    centroid_blob = encode_embedding(np.asarray(centroid_list, dtype=np.float32))
+
+                existing = conn.execute("SELECT id, centroid FROM persons WHERE id = ?", (pid,)).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE persons
+                        SET name = ?, notes = ?, tags = ?, centroid = COALESCE(?, centroid), updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (name, notes, json.dumps(clean_tags, ensure_ascii=False), centroid_blob, now, pid),
+                    )
+                    updated_persons += 1
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO persons (id, name, notes, tags, centroid, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            pid,
+                            name,
+                            notes,
+                            json.dumps(clean_tags, ensure_ascii=False),
+                            centroid_blob,
+                            str(item.get("created_at") or now),
+                            now,
+                        ),
+                    )
+                    imported_persons += 1
+
+        return {"imported_persons": imported_persons, "updated_persons": updated_persons}
 
     # ---------- Detections ----------
     def insert_detection(self, det: dict[str, Any]) -> dict[str, Any]:

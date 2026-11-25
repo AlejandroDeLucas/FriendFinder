@@ -59,6 +59,7 @@ export function App() {
   const [viewerMedia, setViewerMedia] = useState<MediaItem | null>(null);
   const [viewerSeekSec, setViewerSeekSec] = useState<number>(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [pendingSearchFile, setPendingSearchFile] = useState<File | null>(null);
 
   // Toast notification
   const [toast, setToast] = useState<string | null>(null);
@@ -69,6 +70,31 @@ export function App() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 3800);
   }, []);
+
+  const handleSearchFrame = useCallback(
+    (file: File) => {
+      setViewerMedia(null);
+      setSelectedPersonId(null);
+      setPendingSearchFile(file);
+      setTab('search');
+      showToast('Buscando personas de este frame en toda tu biblioteca...');
+    },
+    [showToast]
+  );
+
+  const handleAddFrameToPeople = useCallback(
+    async (file: File) => {
+      try {
+        const res = await api.uploadMedia([file], undefined, false);
+        setViewerMedia(null);
+        setActiveJobId(res.job_id);
+        showToast('Analizando el frame para añadir o actualizar personas...');
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'No se pudo analizar el frame');
+      }
+    },
+    [showToast]
+  );
 
   const refreshAll = useCallback(async () => {
     try {
@@ -416,9 +442,16 @@ export function App() {
             onToast={showToast}
           />
         ) : tab === 'frames' ? (
-          <VideoFramesStudio media={media} onToast={showToast} />
+          <VideoFramesStudio
+            media={media}
+            onSearchFrame={handleSearchFrame}
+            onAddFrameToPeople={handleAddFrameToPeople}
+            onToast={showToast}
+          />
         ) : tab === 'search' ? (
           <SearchByPhoto
+            initialFile={pendingSearchFile}
+            onConsumedInitialFile={() => setPendingSearchFile(null)}
             onSelectPerson={(id) => setSelectedPersonId(id)}
             onOpenMediaAt={openMediaAt}
             onToast={showToast}
@@ -535,6 +568,8 @@ export function App() {
                   filename={viewerMedia.original_filename}
                   videoElementRef={videoRef}
                   compact
+                  onSearchFrame={handleSearchFrame}
+                  onAddFrameToPeople={handleAddFrameToPeople}
                   onToast={showToast}
                 />
               )}
@@ -582,6 +617,7 @@ export function App() {
         <SettingsModal
           onClose={() => setShowSettings(false)}
           onSaved={(s) => setSettings(s)}
+          onBackupImported={refreshAll}
           onToast={showToast}
         />
       )}

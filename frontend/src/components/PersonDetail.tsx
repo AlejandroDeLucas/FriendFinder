@@ -10,16 +10,20 @@ import {
   ImageOff,
   Layers,
   Play,
+  Plus,
   RotateCcw,
   Scissors,
   Sparkles,
   Star,
+  Tag,
   Trash2,
   UserPlus,
   X,
 } from 'lucide-react';
 import { api, assetUrl, formatTime } from '../api';
 import type { Detection, PersonDetail as PersonDetailType, PersonSummary } from '../types';
+
+const PRESET_TAGS = ['Familia', 'Amigos', 'Trabajo', 'Juego'];
 
 interface Props {
   personId: string;
@@ -48,6 +52,7 @@ export function PersonDetail({
   const [formatView, setFormatView] = useState<FormatView>('portrait');
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
+  const [tagDraft, setTagDraft] = useState('');
   const [busyAction, setBusyAction] = useState(false);
   const [exportOpts, setExportOpts] = useState({
     portraits: true,
@@ -382,6 +387,71 @@ export function PersonDetail({
             {person.discarded_count > 0 && (
               <span className="badge badge-warning">{person.discarded_count} descartadas</span>
             )}
+          </div>
+
+          <div className="person-tags-editor">
+            <Tag size={13} style={{ color: 'var(--ink-muted)', flexShrink: 0 }} />
+            {(person.tags || []).map((t) => (
+              <span key={t} className="tag-pill active">
+                {t}
+                <button
+                  type="button"
+                  aria-label={`Quitar etiqueta ${t}`}
+                  onClick={async () => {
+                    const next = (person.tags || []).filter((x) => x !== t);
+                    try {
+                      await api.updatePerson(person.id, { tags: next });
+                      setPerson({ ...person, tags: next });
+                      onPersonChanged();
+                    } catch (err) {
+                      onToast(err instanceof Error ? err.message : 'Error quitando etiqueta');
+                    }
+                  }}
+                >
+                  <X size={11} />
+                </button>
+              </span>
+            ))}
+            {PRESET_TAGS.filter((pt) => !(person.tags || []).includes(pt)).map((pt) => (
+              <button
+                key={pt}
+                type="button"
+                className="tag-pill suggestion"
+                onClick={async () => {
+                  const next = Array.from(new Set([...(person.tags || []), pt]));
+                  try {
+                    await api.updatePerson(person.id, { tags: next });
+                    setPerson({ ...person, tags: next });
+                    onPersonChanged();
+                  } catch (err) {
+                    onToast(err instanceof Error ? err.message : 'Error guardando etiqueta');
+                  }
+                }}
+              >
+                <Plus size={11} /> {pt}
+              </button>
+            ))}
+            <input
+              className="input"
+              style={{ width: 126, padding: '3px 8px', fontSize: '0.77rem' }}
+              placeholder="+ Nueva etiqueta..."
+              value={tagDraft}
+              onChange={(e) => setTagDraft(e.target.value)}
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter' && tagDraft.trim()) {
+                  const clean = tagDraft.trim();
+                  const next = Array.from(new Set([...(person.tags || []), clean]));
+                  setTagDraft('');
+                  try {
+                    await api.updatePerson(person.id, { tags: next });
+                    setPerson({ ...person, tags: next });
+                    onPersonChanged();
+                  } catch (err) {
+                    onToast(err instanceof Error ? err.message : 'Error guardando etiqueta');
+                  }
+                }
+              }}
+            />
           </div>
         </div>
 

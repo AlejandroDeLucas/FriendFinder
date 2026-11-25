@@ -1749,6 +1749,7 @@ export async function reclusterAllBrowserPersons(): Promise<{
       id: c.id,
       name: c.name,
       notes: c.notes,
+      tags: existing?.tags || [],
       centroid: c.centroid,
       reference_embeddings: c.anchors.slice(0, 8),
       cover_detection_id: existing?.cover_detection_id || c.detIds[0] || null,

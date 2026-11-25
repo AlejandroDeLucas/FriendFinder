@@ -94,6 +94,7 @@ def update_person(person_id: str, payload: PersonUpdateRequest) -> dict[str, Any
         person_id,
         name=payload.name,
         notes=payload.notes,
+        tags=payload.tags,
         is_ignored=payload.is_ignored,
         cover_detection_id=payload.cover_detection_id,
     )

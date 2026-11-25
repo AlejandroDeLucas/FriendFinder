@@ -4,11 +4,13 @@ import {
   deleteBrowserPerson,
   deleteStoredDetection,
   ensureBlobsHydrated,
+  exportBrowserBackup,
   getBrowserMediaDetail,
   getBrowserPersonDetail,
   getBrowserSettings,
   getCachedBlobUrl,
   getStoredDetection,
+  importBrowserBackup,
   listBrowserMedia,
   listBrowserPersons,
   mergeBrowserPersons,
@@ -309,7 +311,13 @@ export const api = {
 
   updatePerson: async (
     personId: string,
-    payload: { name?: string; notes?: string; cover_detection_id?: string; is_ignored?: boolean }
+    payload: {
+      name?: string;
+      notes?: string;
+      tags?: string[];
+      cover_detection_id?: string;
+      is_ignored?: boolean;
+    }
   ): Promise<PersonSummary> => {
     const mode = await initEngineMode();
     if (mode === 'browser') return updateBrowserPerson(personId, payload);
@@ -536,5 +544,23 @@ export const api = {
     form.append('face_index', String(faceIndex));
     if (threshold !== undefined) form.append('threshold', String(threshold));
     return request<SearchResult>('/api/search/by-image', { method: 'POST', body: form });
+  },
+
+  exportBackup: async (): Promise<Record<string, unknown>> => {
+    const mode = await initEngineMode();
+    if (mode === 'browser') return exportBrowserBackup();
+    return request<Record<string, unknown>>('/api/backup/export');
+  },
+
+  importBackup: async (
+    payload: Record<string, unknown>
+  ): Promise<{ imported_persons: number; updated_persons: number }> => {
+    const mode = await initEngineMode();
+    if (mode === 'browser') return importBrowserBackup(payload);
+    return request<{ imported_persons: number; updated_persons: number }>('/api/backup/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
   },
 };

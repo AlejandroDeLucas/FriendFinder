@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Scissors,
   Search,
+  Tag,
   Trash2,
   Upload,
   Users,
@@ -220,9 +221,46 @@ export function PeopleGallery({
     }
   };
 
-  const filtered = persons.filter((p) =>
-    p.name.toLowerCase().includes(query.trim().toLowerCase())
-  );
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+
+  const allTags = Array.from(
+    new Set(persons.flatMap((p) => (Array.isArray(p.tags) ? p.tags : [])))
+  ).sort((a, b) => a.localeCompare(b));
+
+  const filtered = persons.filter((p) => {
+    const pTags = Array.isArray(p.tags) ? p.tags : [];
+    if (activeTag && !pTags.includes(activeTag)) return false;
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      p.name.toLowerCase().includes(q) ||
+      pTags.some((t) => t.toLowerCase().includes(q))
+    );
+  });
+
+  const handleBulkTag = async () => {
+    if (selectedIds.length === 0 || busy) return;
+    const raw = window.prompt(
+      'Escribe una etiqueta o grupo para las personas seleccionadas (ej. Familia, Amigos, Trabajo, Juego):'
+    );
+    const clean = raw?.trim();
+    if (!clean) return;
+    setBusy(true);
+    try {
+      for (const id of selectedIds) {
+        const p = persons.find((x) => x.id === id);
+        const existing = Array.isArray(p?.tags) ? p.tags : [];
+        const next = Array.from(new Set([...existing, clean]));
+        await api.updatePerson(id, { tags: next });
+      }
+      onToast(`Etiqueta "${clean}" aplicada a ${selectedIds.length} persona(s).`);
+      onRefresh();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error aplicando etiqueta');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const lastSelectedIdRef = useRef<string | null>(null);
 
@@ -312,15 +350,25 @@ export function PeopleGallery({
   const handleExport = async () => {
     setBusy(true);
     try {
+      const targetIds =
+        selectedIds.length > 0
+          ? selectedIds
+          : activeTag
+            ? filtered.map((p) => p.id)
+            : null;
       await api.exportZip({
-        person_ids: selectedIds.length > 0 ? selectedIds : null,
+        person_ids: targetIds,
         include_portraits: true,
         include_cutouts: true,
         include_crops: true,
         include_originals: false,
         only_kept: true,
       });
-      onToast('Pack ZIP listo para tu videojuego descargado.');
+      onToast(
+        activeTag && selectedIds.length === 0
+          ? `Pack ZIP del grupo "${activeTag}" descargado.`
+          : 'Pack ZIP listo para tu videojuego descargado.'
+      );
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Error al exportar');
     } finally {
@@ -520,6 +568,32 @@ export function PeopleGallery({
         )}
       </div>
 
+      {allTags.length > 0 && (
+        <div className="tag-filter-bar" aria-label="Filtrar por etiqueta o grupo">
+          <Tag size={14} style={{ color: 'var(--ink-muted)', flexShrink: 0 }} />
+          <button
+            type="button"
+            className={`tag-pill ${activeTag === null ? 'active' : ''}`}
+            onClick={() => setActiveTag(null)}
+          >
+            Todos ({persons.length})
+          </button>
+          {allTags.map((tag) => {
+            const count = persons.filter((p) => (p.tags || []).includes(tag)).length;
+            return (
+              <button
+                key={tag}
+                type="button"
+                className={`tag-pill ${activeTag === tag ? 'active' : ''}`}
+                onClick={() => setActiveTag((cur) => (cur === tag ? null : tag))}
+              >
+                {tag} ({count})
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {selectedIds.length > 0 && (
         <div
           className="panel"
@@ -559,6 +633,15 @@ export function PeopleGallery({
                 Seleccionar todos ({filtered.length})
               </button>
             )}
+            <button
+              id="btn-tag-selected"
+              className="btn btn-sm"
+              disabled={busy}
+              onClick={() => void handleBulkTag()}
+              title="Añadir una etiqueta o grupo a las personas seleccionadas"
+            >
+              <Tag size={14} /> Etiquetar
+            </button>
             {selectedIds.length >= 2 && (
               <button
                 id="btn-merge-selected"
@@ -829,6 +912,22 @@ export function PeopleGallery({
                     </span>
                   )}
                 </div>
+                {person.tags && person.tags.length > 0 && (
+                  <div className="person-card-tags">
+                    {person.tags.slice(0, 4).map((t) => (
+                      <span
+                        key={t}
+                        className="person-card-tag-chip"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveTag((cur) => (cur === t ? null : t));
+                        }}
+                      >
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             </article>
           );

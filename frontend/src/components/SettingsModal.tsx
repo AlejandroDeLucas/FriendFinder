@@ -1,19 +1,67 @@
-import { useEffect, useState } from 'react';
-import { Cloud, Cpu, Save, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Cloud, Cpu, Database, Download, Save, Upload, X } from 'lucide-react';
 import { api, getApiBase, setApiBase } from '../api';
 import type { AppSettings, SystemStats } from '../types';
 
 interface Props {
   onClose: () => void;
   onSaved: (settings: AppSettings) => void;
+  onBackupImported?: () => void;
   onToast: (msg: string) => void;
 }
 
-export function SettingsModal({ onClose, onSaved, onToast }: Props) {
+export function SettingsModal({ onClose, onSaved, onBackupImported, onToast }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [device, setDevice] = useState<SystemStats['device'] | null>(null);
   const [apiBaseDraft, setApiBaseDraft] = useState<string>(getApiBase());
   const [saving, setSaving] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const backupInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleExportBackup = async () => {
+    setBackupBusy(true);
+    try {
+      const data = await api.exportBackup();
+      const jsonStr = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const day = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `FriendFinder_Backup_${day}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1200);
+      const count = Array.isArray(data.persons) ? data.persons.length : 0;
+      onToast(`Copia exportada (${count} identidad(es) facial(es) y etiquetas).`);
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'Error exportando copia de seguridad');
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleImportBackupFile = async (file: File) => {
+    setBackupBusy(true);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const res = await api.importBackup(parsed);
+      onToast(
+        `Copia importada: ${res.imported_persons} persona(s) nueva(s) y ${res.updated_persons} actualizada(s).`
+      );
+      onBackupImported?.();
+    } catch (err) {
+      onToast(
+        err instanceof Error
+          ? `Archivo de copia no válido: ${err.message}`
+          : 'Error importando copia de seguridad'
+      );
+    } finally {
+      setBackupBusy(false);
+    }
+  };
 
   useEffect(() => {
     api
@@ -322,6 +370,66 @@ export function SettingsModal({ onClose, onSaved, onToast }: Props) {
                 Si usas <code>./run-cloudflare.sh</code>, déjalo vacío: todo funciona desde una
                 sola URL HTTPS.
               </span>
+            </div>
+          </div>
+
+          {/* Local Backup Export / Import (.json) */}
+          <div
+            style={{
+              borderTop: '1px solid var(--border-hairline)',
+              paddingTop: 16,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+            }}
+          >
+            <h3
+              style={{
+                margin: 0,
+                fontSize: '0.94rem',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 7,
+              }}
+            >
+              <Database size={16} style={{ color: 'var(--accent)' }} />
+              Copia de seguridad local (nombres, etiquetas e identidades faciales)
+            </h3>
+            <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--ink-secondary)' }}>
+              Exporta un archivo <code>.json</code> con todas tus personas nombradas, etiquetas y
+              perfiles faciales para restaurarlos en otro navegador o móvil sin perder el
+              reconocimiento automático.
+            </p>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                id="btn-export-backup"
+                type="button"
+                className="btn btn-sm"
+                disabled={backupBusy}
+                onClick={() => void handleExportBackup()}
+              >
+                <Download size={14} /> Exportar copia (.json)
+              </button>
+              <button
+                id="btn-import-backup"
+                type="button"
+                className="btn btn-sm"
+                disabled={backupBusy}
+                onClick={() => backupInputRef.current?.click()}
+              >
+                <Upload size={14} /> Importar copia (.json)
+              </button>
+              <input
+                ref={backupInputRef}
+                type="file"
+                accept="application/json,.json"
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleImportBackupFile(f);
+                  e.target.value = '';
+                }}
+              />
             </div>
           </div>
         </div>
