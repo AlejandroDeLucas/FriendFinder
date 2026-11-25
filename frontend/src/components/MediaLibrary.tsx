@@ -1,5 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, Clock, Film, Image as ImageIcon, Pin, Play, Trash2, Upload } from 'lucide-react';
+import {
+  Check,
+  Clapperboard,
+  Clock,
+  Film,
+  Image as ImageIcon,
+  Pin,
+  Play,
+  Trash2,
+  Upload,
+} from 'lucide-react';
 import { api, assetUrl, formatBytes, formatTime, formatTimeRemaining } from '../api';
 import type { MediaItem } from '../types';
 
@@ -440,7 +450,20 @@ export function MediaLibrary({
                   }}
                 >
                   <span>{formatBytes(item.file_size)}</span>
-                  <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                    {!deleted && item.media_type === 'video' && (
+                      <button
+                        className="btn btn-dark btn-sm"
+                        style={{ padding: '4px 8px', fontSize: '0.75rem' }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenMediaAt(item.id, 0);
+                        }}
+                        title="Sacar primer y último frame listos para copiar y pegar"
+                      >
+                        <Clapperboard size={12} /> Frames
+                      </button>
+                    )}
                     {!deleted && (
                       <button
                         className={`btn btn-sm ${keepForever ? 'btn-ghost' : 'btn-primary'}`}

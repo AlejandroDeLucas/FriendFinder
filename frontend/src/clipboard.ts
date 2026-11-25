@@ -63,3 +63,76 @@ export async function readImagesFromClipboardApi(): Promise<File[]> {
   }
   return files;
 }
+
+export function extractVideosFromPasteEvent(event: ClipboardEvent): File[] {
+  const files: File[] = [];
+  const items = event.clipboardData?.items;
+  const isVideoFile = (f: File) =>
+    f.type.startsWith('video/') || /\.(mp4|mov|webm|mkv|m4v|avi|3gp|ogv)$/i.test(f.name);
+
+  if (items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === 'file') {
+        const raw = item.getAsFile();
+        if (raw && isVideoFile(raw)) {
+          files.push(raw);
+        }
+      }
+    }
+  }
+  if (files.length === 0 && event.clipboardData?.files?.length) {
+    Array.from(event.clipboardData.files).forEach((f) => {
+      if (isVideoFile(f)) files.push(f);
+    });
+  }
+  return files;
+}
+
+async function ensurePngBlob(blob: Blob): Promise<Blob> {
+  if (blob.type === 'image/png') return blob;
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('No se pudo convertir la imagen a PNG'));
+      el.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    canvas.getContext('2d')!.drawImage(img, 0, 0);
+    return await new Promise<Blob>((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Error generando PNG'))), 'image/png')
+    );
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** Copies an image Blob (as lossless PNG) directly to the system clipboard so the user can Ctrl+V / paste anywhere. */
+export async function copyImageBlobToClipboard(blob: Blob): Promise<void> {
+  if (
+    typeof navigator === 'undefined' ||
+    !navigator.clipboard ||
+    typeof navigator.clipboard.write !== 'function' ||
+    typeof ClipboardItem === 'undefined'
+  ) {
+    throw new Error(
+      'Tu navegador no permite copiar imágenes directamente. Usa el botón Descargar PNG.'
+    );
+  }
+  // Passing a Promise<Blob> to ClipboardItem keeps Safari/iOS user-gesture activation intact!
+  const pngPromise = blob.type === 'image/png' ? Promise.resolve(blob) : ensurePngBlob(blob);
+  try {
+    const item = new ClipboardItem({ 'image/png': pngPromise });
+    await navigator.clipboard.write([item]);
+  } catch {
+    // Fallback for browsers that require a resolved Blob inside ClipboardItem
+    const pngBlob = await pngPromise;
+    const item = new ClipboardItem({ 'image/png': pngBlob });
+    await navigator.clipboard.write([item]);
+  }
+}
+

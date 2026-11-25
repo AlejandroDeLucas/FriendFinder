@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Camera,
+  Clapperboard,
   Film,
   Lock,
   Play,
@@ -26,9 +27,11 @@ import { PersonDetail } from './components/PersonDetail';
 import { SearchByPhoto } from './components/SearchByPhoto';
 import { SettingsModal } from './components/SettingsModal';
 import { UploadStudio } from './components/UploadStudio';
+import { VideoFrameExtractor } from './components/VideoFrameExtractor';
+import { VideoFramesStudio } from './components/VideoFramesStudio';
 import type { AppSettings, JobInfo, MediaItem, PersonSummary, SystemStats } from './types';
 
-type Tab = 'people' | 'upload' | 'search' | 'library';
+type Tab = 'people' | 'upload' | 'frames' | 'search' | 'library';
 
 export function App() {
   const [tab, setTab] = useState<Tab>('people');
@@ -310,6 +313,15 @@ export function App() {
             </button>
 
             <button
+              id="nav-frames"
+              className={`nav-tab ${tab === 'frames' && !selectedPersonId ? 'active' : ''}`}
+              onClick={() => navigateTab('frames')}
+            >
+              <Clapperboard size={15} />
+              Frames
+            </button>
+
+            <button
               id="nav-search"
               className={`nav-tab ${tab === 'search' && !selectedPersonId ? 'active' : ''}`}
               onClick={() => navigateTab('search')}
@@ -403,6 +415,8 @@ export function App() {
             onPersonsUpdated={refreshAll}
             onToast={showToast}
           />
+        ) : tab === 'frames' ? (
+          <VideoFramesStudio media={media} onToast={showToast} />
         ) : tab === 'search' ? (
           <SearchByPhoto
             onSelectPerson={(id) => setSelectedPersonId(id)}
@@ -438,6 +452,13 @@ export function App() {
           <span>Subir</span>
         </button>
         <button
+          className={`mobile-dock-btn ${tab === 'frames' && !selectedPersonId ? 'active' : ''}`}
+          onClick={() => navigateTab('frames')}
+        >
+          <Clapperboard size={19} />
+          <span>Frames</span>
+        </button>
+        <button
           className={`mobile-dock-btn ${tab === 'search' && !selectedPersonId ? 'active' : ''}`}
           onClick={() => navigateTab('search')}
         >
@@ -453,7 +474,7 @@ export function App() {
         </button>
       </nav>
 
-      {/* Media / Video Player Modal with clickable person timestamps */}
+      {/* Media / Video Player Modal with clickable person timestamps + First/Last Frame Extractor */}
       {viewerMedia && (
         <div className="modal-backdrop" onClick={() => setViewerMedia(null)}>
           <div
@@ -494,9 +515,10 @@ export function App() {
                   <video
                     ref={videoRef}
                     src={assetUrl.mediaStream(viewerMedia.id)}
+                    crossOrigin="anonymous"
                     controls
                     playsInline
-                    style={{ width: '100%', maxHeight: 460 }}
+                    style={{ width: '100%', maxHeight: 420 }}
                   />
                 ) : (
                   <img
@@ -506,6 +528,16 @@ export function App() {
                   />
                 )}
               </div>
+
+              {!viewerMedia.source_deleted && viewerMedia.media_type === 'video' && (
+                <VideoFrameExtractor
+                  videoUrl={assetUrl.mediaStream(viewerMedia.id)}
+                  filename={viewerMedia.original_filename}
+                  videoElementRef={videoRef}
+                  compact
+                  onToast={showToast}
+                />
+              )}
 
               {viewerMedia.detections && viewerMedia.detections.length > 0 && (
                 <div>
